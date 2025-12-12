@@ -1,0 +1,17 @@
+[project]
+name = "microfluidic-backend"
+version = "0.1.0"
+description = "FastAPI backend for microfluidic DXF converter"
+requires-python = ">=3.12"
+# Note: The core package (microfluidic-ir) should be installed first.
+# The Makefile handles this automatically with: make install
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-multipart>=0.0.6",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
