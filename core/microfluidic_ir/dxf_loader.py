@@ -5,6 +5,9 @@ from pathlib import Path
 from shapely.geometry import Polygon
 import hashlib
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def load_dxf(file_path: str, snap_close_tol: float = 2.0) -> dict:
@@ -26,6 +29,8 @@ def load_dxf(file_path: str, snap_close_tol: float = 2.0) -> dict:
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"DXF file not found: {file_path}")
+    
+    logger.debug(f"Loading DXF: {file_path}")
     
     # Compute file hash
     with open(path, 'rb') as f:
@@ -156,7 +161,7 @@ def load_dxf(file_path: str, snap_close_tol: float = 2.0) -> dict:
     else:
         bounds = {'xmin': 0, 'ymin': 0, 'xmax': 0, 'ymax': 0}
     
-    return {
+    result = {
         'layers': sorted(list(layers)),
         'polygons': polygons,
         'circles': circles,
@@ -165,3 +170,7 @@ def load_dxf(file_path: str, snap_close_tol: float = 2.0) -> dict:
         'source_filename': path.name,
         'import_timestamp': datetime.utcnow().isoformat() + 'Z'
     }
+    
+    logger.debug(f"DXF loaded: {len(polygons)} polygons, {len(circles)} circles, {len(layers)} layers")
+    
+    return result

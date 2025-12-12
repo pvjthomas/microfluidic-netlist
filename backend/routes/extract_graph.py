@@ -126,11 +126,16 @@ async def extract_graph(req: ExtractGraphRequest):
                 'snapped': False
             })
     
-    # Save graph result to session
+    # Save graph result to session (exclude skeleton_graph as it's not JSON-serializable)
     session_dir = get_session_dir(req.session_id)
     graph_path = session_dir / "graph_result.json"
+    # Create serializable copy without skeleton_graph
+    serializable_result = {
+        'nodes': graph_result['nodes'],
+        'edges': graph_result['edges']
+    }
     with open(graph_path, 'w') as f:
-        json.dump(graph_result, f, indent=2)
+        json.dump(serializable_result, f, indent=2)
     
     return ExtractGraphResponse(
         nodes=graph_result['nodes'],

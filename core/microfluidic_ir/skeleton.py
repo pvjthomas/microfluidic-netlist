@@ -7,6 +7,9 @@ import networkx as nx
 from skimage.morphology import skeletonize
 from skimage import measure
 from typing import List, Tuple, Dict, Any
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def rasterize_polygon(
@@ -42,18 +45,30 @@ def rasterize_polygon(
     img_width = int(np.ceil(padded_width * px_per_unit))
     img_height = int(np.ceil(padded_height * px_per_unit))
     
+    import time
+    logger.info(f"Rasterizing: image shape ({img_height}, {img_width}), {img_height * img_width} pixels")
+    
     # Create coordinate arrays
+    start = time.time()
     x_coords = np.linspace(padded_minx, padded_minx + padded_width, img_width)
     y_coords = np.linspace(padded_miny, padded_miny + padded_height, img_height)
+    coord_time = time.time() - start
+    logger.info(f"  Coordinate arrays: {coord_time:.2f}s")
     
     # Create binary image by checking if each pixel center is inside polygon
     binary_img = np.zeros((img_height, img_width), dtype=bool)
     
+    start = time.time()
     for i, y in enumerate(y_coords):
         for j, x in enumerate(x_coords):
             point = Point(x, y)
             if polygon.contains(point) or polygon.touches(point):
                 binary_img[i, j] = True
+    fill_time = time.time() - start
+    logger.info(f"  Filling pixels: {fill_time:.2f}s")
+    
+    num_pixels = np.sum(binary_img)
+    logger.info(f"Rasterized: {num_pixels} filled pixels ({100.0 * num_pixels / (img_height * img_width):.1f}%) in {coord_time + fill_time:.2f}s total")
     
     transform = {
         'origin_x': padded_minx,
@@ -110,14 +125,25 @@ def skeletonize_polygon(
     binary_img, transform = rasterize_polygon(polygon, px_per_unit=px_per_unit)
     
     # Skeletonize using scikit-image
+    import time
+    logger.info("Skeletonizing binary image")
+    start = time.time()
     skeleton_img = skeletonize(binary_img)
+    skeleton_time = time.time() - start
+    logger.info(f"  Skeletonization algorithm: {skeleton_time:.2f}s")
     
     # Find skeleton pixels (non-zero)
+    start = time.time()
     skeleton_pixels = np.argwhere(skeleton_img)
+    find_time = time.time() - start
+    logger.info(f"  Finding skeleton pixels: {find_time:.2f}s")
     
     if len(skeleton_pixels) == 0:
         # Empty skeleton - return empty graph
+        logger.info("Empty skeleton")
         return nx.Graph(), transform
+    
+    logger.info(f"Skeleton: {len(skeleton_pixels)} skeleton pixels in {skeleton_time + find_time:.2f}s total")
     
     # Convert skeleton pixels to coordinate space
     skeleton_coords = []
@@ -127,17 +153,22 @@ def skeletonize_polygon(
     
     # Build graph from skeleton pixels
     # Each pixel becomes a node, connected to its 8-connected neighbors
+    import time
     G = nx.Graph()
     
     # Add all skeleton pixels as nodes
+    start = time.time()
     pixel_to_node = {}
     for i, pixel in enumerate(skeleton_pixels):
         coords = pixel_to_coords((pixel[0], pixel[1]), transform)
         node_id = i
         G.add_node(node_id, xy=coords)
         pixel_to_node[tuple(pixel)] = node_id
+    node_time = time.time() - start
+    logger.info(f"  Adding nodes: {node_time:.2f}s")
     
     # Connect neighboring pixels (8-connected)
+    start = time.time()
     for pixel in skeleton_pixels:
         row, col = pixel[0], pixel[1]
         node_id = pixel_to_node[(row, col)]
@@ -156,6 +187,10 @@ def skeletonize_polygon(
                         x2, y2 = G.nodes[neighbor_id]['xy']
                         dist = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
                         G.add_edge(node_id, neighbor_id, weight=dist)
+    edge_time = time.time() - start
+    logger.info(f"  Adding edges: {edge_time:.2f}s")
+    
+    logger.info(f"Skeleton graph: {len(G.nodes())} nodes, {len(G.edges())} edges in {node_time + edge_time:.2f}s total")
     
     return G, transform
 

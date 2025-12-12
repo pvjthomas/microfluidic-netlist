@@ -4,6 +4,9 @@ from typing import List, Dict, Any, Tuple
 from shapely.geometry import Point
 import networkx as nx
 from .skeleton import skeletonize_polygon, extract_skeleton_paths
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def extract_graph_from_polygon(
@@ -26,6 +29,7 @@ def extract_graph_from_polygon(
         - skeleton_graph: NetworkX graph (for debugging)
     """
     # Skeletonize polygon
+    logger.info("Building graph from skeleton")
     skeleton_graph, transform = skeletonize_polygon(
         polygon,
         px_per_unit=px_per_unit,
@@ -33,6 +37,7 @@ def extract_graph_from_polygon(
     )
     
     if len(skeleton_graph) == 0:
+        logger.info("Empty skeleton graph")
         return {
             'nodes': [],
             'edges': [],
@@ -40,13 +45,22 @@ def extract_graph_from_polygon(
         }
     
     # Extract paths
+    import time
+    start = time.time()
     paths = extract_skeleton_paths(skeleton_graph, simplify_tolerance=simplify_tolerance)
+    path_time = time.time() - start
+    logger.info(f"Extracted {len(paths)} paths in {path_time:.2f}s")
     
     # Identify nodes: endpoints and junctions
+    start = time.time()
     endpoints = [n for n in skeleton_graph.nodes() if skeleton_graph.degree(n) == 1]
     junctions = [n for n in skeleton_graph.nodes() if skeleton_graph.degree(n) >= 3]
+    identify_time = time.time() - start
+    logger.info(f"Identified nodes: {len(endpoints)} endpoints, {len(junctions)} junctions in {identify_time:.2f}s")
     
     # Build node list
+    import time
+    start = time.time()
     nodes = []
     node_id_map = {}  # Map from skeleton node ID to graph node ID
     
@@ -74,8 +88,11 @@ def extract_graph_from_polygon(
             'degree': 1,
             'skeleton_node_id': end_node
         })
+    node_build_time = time.time() - start
+    logger.info(f"  Building node list: {node_build_time:.2f}s")
     
     # Build edges from paths
+    start = time.time()
     edges = []
     edge_counter = 1
     
@@ -129,6 +146,10 @@ def extract_graph_from_polygon(
                         'coordinates': [[float(x), float(y)] for x, y in path]
                     }
                 })
+    edge_build_time = time.time() - start
+    logger.info(f"  Building edge list: {edge_build_time:.2f}s")
+    
+    logger.info(f"Graph built: {len(nodes)} nodes, {len(edges)} edges in {node_build_time + edge_build_time:.2f}s total")
     
     return {
         'nodes': nodes,
