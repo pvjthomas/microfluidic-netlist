@@ -250,7 +250,23 @@ Convert pixel paths back to coordinate space (polyline simplification)
 
 Optionally smooth centerlines (simplify tolerance)
 
-(Polygon skeleton is the simplest reliable v1 even if it’s “approximate”; your overlay + manual correction can handle edge cases.)
+(Polygon skeleton is the simplest reliable v1 even if it's "approximate"; your overlay + manual correction can handle edge cases.)
+
+Skeletonization Strategy (V1)
+
+Performance optimizations for V1:
+
+Replace point-in-polygon loops with PIL-based raster fill. Use PIL's ImageDraw to fill polygon interiors, which is faster than per-pixel Shapely contains() checks and natively supports holes (interior rings).
+
+Add guardrails on raster size to prevent memory exhaustion:
+
+enforce maximum pixels (e.g., 50M pixels) or maximum image dimension (e.g., 10k pixels per side)
+
+if polygon would exceed limits, reduce px_per_unit automatically and warn
+
+Crop to tight mask bounds before skeletonize. After rasterization, crop the binary image to the tight bounding box of filled pixels to reduce memory and processing time for the skeletonization algorithm.
+
+Keep architecture open for "multiscale refinement" later. Design the rasterization interface to allow future enhancements like adaptive resolution (higher resolution near junctions, lower in straight segments) or hierarchical skeletonization without breaking existing code paths.
 
 D) Edge segmentation rules
 
