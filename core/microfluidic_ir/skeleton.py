@@ -8,6 +8,8 @@ from skimage.morphology import skeletonize
 from skimage import measure
 from typing import List, Tuple, Dict, Any
 import logging
+import time
+from PIL import Image, ImageDraw
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +20,7 @@ def rasterize_polygon(
     padding: float = 10.0
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
-    Rasterize a Shapely polygon to a binary image.
+    Rasterize a Shapely polygon to a binary image using PIL ImageDraw.
     
     Args:
         polygon: Shapely polygon to rasterize
@@ -30,6 +32,8 @@ def rasterize_polygon(
         - origin_x, origin_y: Top-left corner in original coordinates
         - px_per_unit: Resolution
     """
+    start_raster = time.time()
+    
     # Get bounds and add padding
     bounds = polygon.bounds  # (minx, miny, maxx, maxy)
     width = bounds[2] - bounds[0]
@@ -45,30 +49,69 @@ def rasterize_polygon(
     img_width = int(np.ceil(padded_width * px_per_unit))
     img_height = int(np.ceil(padded_height * px_per_unit))
     
-    import time
-    logger.info(f"Rasterizing: image shape ({img_height}, {img_width}), {img_height * img_width} pixels")
+    # Guardrail: check raster size limits
+    max_dimension = 8000
+    max_pixels = 25_000_000
     
-    # Create coordinate arrays
-    start = time.time()
-    x_coords = np.linspace(padded_minx, padded_minx + padded_width, img_width)
-    y_coords = np.linspace(padded_miny, padded_miny + padded_height, img_height)
-    coord_time = time.time() - start
-    logger.info(f"  Coordinate arrays: {coord_time:.2f}s")
+    if img_width > max_dimension or img_height > max_dimension:
+        raise ValueError(
+            f"Raster size {img_width}×{img_height} exceeds maximum dimension {max_dimension}. "
+            f"Reduce px_per_unit (currently {px_per_unit}) or polygon size."
+        )
     
-    # Create binary image by checking if each pixel center is inside polygon
-    binary_img = np.zeros((img_height, img_width), dtype=bool)
+    total_pixels = img_width * img_height
+    if total_pixels > max_pixels:
+        raise ValueError(
+            f"Raster size {img_width}×{img_height} = {total_pixels} pixels exceeds maximum {max_pixels}. "
+            f"Reduce px_per_unit (currently {px_per_unit}) or polygon size."
+        )
     
-    start = time.time()
-    for i, y in enumerate(y_coords):
-        for j, x in enumerate(x_coords):
-            point = Point(x, y)
-            if polygon.contains(point) or polygon.touches(point):
-                binary_img[i, j] = True
-    fill_time = time.time() - start
-    logger.info(f"  Filling pixels: {fill_time:.2f}s")
+    logger.info(f"Rasterizing: image shape ({img_height}, {img_width}), {total_pixels} pixels")
     
+    # Create PIL image (black = 0, white = 1)
+    img = Image.new('1', (img_width, img_height), 0)
+    draw = ImageDraw.Draw(img)
+    
+    # Convert polygon coordinates to PIL image coordinates
+    # PIL uses: (0,0) at top-left, x increases right, y increases down
+    # pixel_to_coords uses: y = origin_y + (row / px_per_unit), so row 0 maps to origin_y (minimum y)
+    # This means our image has y increasing upward (row increases = y increases in coords)
+    # Conversion: image_x = (shapely_x - padded_minx) * px_per_unit
+    #            image_y = (shapely_y - padded_miny) * px_per_unit (same direction)
+    
+    def shapely_to_image_coords(shapely_x: float, shapely_y: float) -> Tuple[int, int]:
+        """Convert Shapely coordinates to PIL image coordinates.
+        
+        Note: pixel_to_coords uses y = origin_y + (row / px_per_unit), so row 0 
+        corresponds to minimum y (bottom in standard view, but our origin_y is min_y).
+        PIL ImageDraw expects coordinates with y increasing downward, but we'll flip
+        the image vertically after drawing to match the transform semantics.
+        """
+        img_x = int((shapely_x - padded_minx) * px_per_unit)
+        # Flip y-axis: PIL y increases down, but our transform has y increase up with row
+        img_y = int(img_height - 1 - (shapely_y - padded_miny) * px_per_unit)
+        return (img_x, img_y)
+    
+    # Fill exterior with 1 (white)
+    exterior_coords = [shapely_to_image_coords(x, y) for x, y in polygon.exterior.coords[:-1]]  # Exclude last duplicate
+    if len(exterior_coords) >= 3:  # Need at least 3 points for a polygon
+        draw.polygon(exterior_coords, fill=1, outline=1)
+    
+    # Clear each interior ring (hole) with 0 (black)
+    for interior in polygon.interiors:
+        interior_coords = [shapely_to_image_coords(x, y) for x, y in interior.coords[:-1]]  # Exclude last duplicate
+        if len(interior_coords) >= 3:
+            draw.polygon(interior_coords, fill=0, outline=0)
+    
+    # Convert PIL image to numpy array and flip vertically to match transform semantics
+    # (pixel_to_coords expects row 0 = min y, but PIL draws with y=0 at top)
+    binary_img = np.array(img, dtype=bool)
+    binary_img = np.flipud(binary_img)  # Flip vertically to match transform semantics
+    
+    raster_time = time.time() - start_raster
     num_pixels = np.sum(binary_img)
-    logger.info(f"Rasterized: {num_pixels} filled pixels ({100.0 * num_pixels / (img_height * img_width):.1f}%) in {coord_time + fill_time:.2f}s total")
+    logger.info(f"  Raster fill: {raster_time:.2f}s")
+    logger.info(f"Rasterized: {num_pixels} filled pixels ({100.0 * num_pixels / total_pixels:.1f}%) in {raster_time:.2f}s total")
     
     transform = {
         'origin_x': padded_minx,
@@ -124,12 +167,45 @@ def skeletonize_polygon(
     # Rasterize polygon
     binary_img, transform = rasterize_polygon(polygon, px_per_unit=px_per_unit)
     
+    # Crop to tight mask bounds before skeletonize (plus small margin)
+    start_crop = time.time()
+    # Find bounding box of filled pixels
+    filled_rows, filled_cols = np.where(binary_img)
+    
+    if len(filled_rows) == 0:
+        # No filled pixels - return empty graph
+        logger.info("Empty raster - no filled pixels")
+        return nx.Graph(), transform
+    
+    # Get tight bounds
+    min_row = max(0, int(filled_rows.min()) - 2)  # 2 pixel margin
+    max_row = min(binary_img.shape[0], int(filled_rows.max()) + 3)  # 3 pixel margin
+    min_col = max(0, int(filled_cols.min()) - 2)  # 2 pixel margin
+    max_col = min(binary_img.shape[1], int(filled_cols.max()) + 3)  # 3 pixel margin
+    
+    # Crop the image
+    cropped_img = binary_img[min_row:max_row, min_col:max_col]
+    
+    # Adjust transform to account for cropping
+    # pixel_to_coords: x = origin_x + (col / px_per_unit), y = origin_y + (row / px_per_unit)
+    # So row offset directly affects y, and col offset directly affects x
+    col_offset_in_coords = min_col / transform['px_per_unit']
+    row_offset_in_coords = min_row / transform['px_per_unit']
+    
+    # Update transform origin
+    transform['origin_x'] = transform['origin_x'] + col_offset_in_coords
+    transform['origin_y'] = transform['origin_y'] + row_offset_in_coords
+    transform['img_width'] = cropped_img.shape[1]
+    transform['img_height'] = cropped_img.shape[0]
+    
+    crop_time = time.time() - start_crop
+    logger.info(f"Cropped to tight bounds: ({cropped_img.shape[0]}, {cropped_img.shape[1]}) in {crop_time:.2f}s")
+    
     # Skeletonize using scikit-image
-    import time
     logger.info("Skeletonizing binary image")
-    start = time.time()
-    skeleton_img = skeletonize(binary_img)
-    skeleton_time = time.time() - start
+    start_skeleton = time.time()
+    skeleton_img = skeletonize(cropped_img)
+    skeleton_time = time.time() - start_skeleton
     logger.info(f"  Skeletonization algorithm: {skeleton_time:.2f}s")
     
     # Find skeleton pixels (non-zero)
