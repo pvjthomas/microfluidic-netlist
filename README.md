@@ -1,3 +1,12 @@
+## Development setup
+
+This project uses a local Python virtual environment.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
 # Microfluidic DXF to Network IR Converter
 
 Convert 2D microfluidic mask designs (DXF) into a canonical graph IR, generate SPICE-like netlists, and export tagged overlays.

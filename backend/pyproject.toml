@@ -2,7 +2,7 @@
 name = "microfluidic-backend"
 version = "0.1.0"
 description = "FastAPI backend for microfluidic DXF converter"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 # Note: The core package (microfluidic-ir) should be installed first.
 # The Makefile handles this automatically with: make install
 dependencies = [
