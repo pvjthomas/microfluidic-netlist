@@ -5,6 +5,8 @@ from shapely.geometry import Point, Polygon, LineString, MultiPoint, GeometryCol
 import networkx as nx
 import numpy as np
 from scipy.interpolate import splprep, splev
+from scipy.signal import savgol_filter
+from scipy.linalg import lstsq
 from .skeleton import (
     skeletonize_polygon, 
     extract_skeleton_paths,
@@ -25,72 +27,211 @@ def snap_endpoint_to_boundary(
     endpoint_xy: Tuple[float, float],
     polygon: Polygon,
     skeleton_graph: nx.Graph,
-    endpoint_node_id: Optional[int] = None
+    endpoint_node_id: Optional[int] = None,
+    incident_edge_coords: Optional[List[Tuple[float, float]]] = None
 ) -> Tuple[float, float]:
     """
-    Snap an endpoint to the nearest point on the polygon boundary.
+    Snap an endpoint to the polygon boundary by following the edge tangent.
     
-    After spur pruning, endpoints may be offset from the actual boundary.
-    This function projects them to the nearest boundary point.
+    Extends a line from the endpoint along the tangent direction of the incident edge
+    until it intersects the polygon boundary.
     
     Args:
         endpoint_xy: Current endpoint coordinates (x, y)
         polygon: Shapely polygon
-        skeleton_graph: Skeleton graph (to find direction towards boundary)
-        endpoint_node_id: Optional skeleton node ID to find direction from neighbors
+        skeleton_graph: Skeleton graph (fallback for direction if edge coords not provided)
+        endpoint_node_id: Optional skeleton node ID (fallback for direction)
+        incident_edge_coords: Optional list of (x, y) coordinates of the incident edge centerline
         
     Returns:
         Snapped coordinates (x, y) on polygon boundary
     """
     endpoint_point = Point(endpoint_xy)
     
-    # Find nearest point on polygon boundary
-    boundary_point = polygon.boundary.interpolate(
-        polygon.boundary.project(endpoint_point)
-    )
+    # Determine tangent direction from incident edge
+    tangent_direction = None
     
-    # If we have the skeleton node, try to find direction towards boundary
-    # by looking at the edge direction from the endpoint
-    if endpoint_node_id is not None and endpoint_node_id in skeleton_graph:
+    if incident_edge_coords and len(incident_edge_coords) >= 2:
+        # Use the incident edge to determine tangent direction
+        # Check if endpoint is at start or end of edge
+        start_dist = ((incident_edge_coords[0][0] - endpoint_xy[0])**2 + 
+                     (incident_edge_coords[0][1] - endpoint_xy[1])**2)**0.5
+        end_dist = ((incident_edge_coords[-1][0] - endpoint_xy[0])**2 + 
+                   (incident_edge_coords[-1][1] - endpoint_xy[1])**2)**0.5
+        
+        if start_dist < end_dist:
+            # Endpoint is at start of edge, extend in opposite direction (towards boundary)
+            # Use direction from first to second point, then reverse
+            dx = incident_edge_coords[0][0] - incident_edge_coords[1][0]
+            dy = incident_edge_coords[0][1] - incident_edge_coords[1][1]
+        else:
+            # Endpoint is at end of edge, extend in forward direction (towards boundary)
+            # Use direction from second-to-last to last point
+            dx = incident_edge_coords[-1][0] - incident_edge_coords[-2][0]
+            dy = incident_edge_coords[-1][1] - incident_edge_coords[-2][1]
+        
+        # Normalize direction
+        length = (dx**2 + dy**2)**0.5
+        if length > 1e-6:
+            tangent_direction = (dx / length, dy / length)
+    
+    # Fallback: use skeleton graph to find direction
+    if tangent_direction is None and endpoint_node_id is not None and endpoint_node_id in skeleton_graph:
         neighbors = list(skeleton_graph.neighbors(endpoint_node_id))
         if neighbors:
             # Get direction from endpoint to its neighbor
             neighbor_xy = skeleton_graph.nodes[neighbors[0]]['xy']
-            direction = (
-                endpoint_xy[0] - neighbor_xy[0],
-                endpoint_xy[1] - neighbor_xy[1]
+            dx = endpoint_xy[0] - neighbor_xy[0]
+            dy = endpoint_xy[1] - neighbor_xy[1]
+            # Normalize direction (reverse because we want direction away from neighbor)
+            length = (dx**2 + dy**2)**0.5
+            if length > 1e-6:
+                tangent_direction = (-dx / length, -dy / length)
+    
+    # Final fallback: use nearest boundary point projection
+    if tangent_direction is None:
+        boundary_point = polygon.boundary.interpolate(
+            polygon.boundary.project(endpoint_point)
+        )
+        return (boundary_point.x, boundary_point.y)
+    
+    # Extend line from endpoint along tangent direction until it hits boundary
+    # Use a long extension distance to ensure we hit the boundary
+    extension_distance = 10000.0  # 10mm should be enough for most cases
+    extended_point = Point(
+        endpoint_xy[0] + tangent_direction[0] * extension_distance,
+        endpoint_xy[1] + tangent_direction[1] * extension_distance
+    )
+    line = LineString([endpoint_point, extended_point])
+    
+    # Find intersection with polygon boundary
+    intersection = polygon.boundary.intersection(line)
+    
+    if intersection and not intersection.is_empty:
+        if intersection.geom_type == 'Point':
+            boundary_point = intersection
+        elif intersection.geom_type == 'MultiPoint' and len(intersection.geoms) > 0:
+            # Take closest intersection point to endpoint
+            boundary_point = min(
+                intersection.geoms,
+                key=lambda p: endpoint_point.distance(p)
             )
-            # Normalize direction
-            length = (direction[0]**2 + direction[1]**2)**0.5
-            if length > 0:
-                direction = (direction[0] / length, direction[1] / length)
-                
-                # Project endpoint along this direction to find boundary intersection
-                # Extend line from endpoint in the direction away from neighbor
-                extended_point = Point(
-                    endpoint_xy[0] + direction[0] * 1000.0,  # Extend far
-                    endpoint_xy[1] + direction[1] * 1000.0
-                )
-                line = LineString([endpoint_point, extended_point])
-                
-                # Find intersection with polygon boundary
-                intersection = polygon.boundary.intersection(line)
-                if intersection and not intersection.is_empty:
-                    if intersection.geom_type == 'Point':
-                        boundary_point = intersection
-                    elif intersection.geom_type == 'MultiPoint' and len(intersection.geoms) > 0:
-                        # Take closest intersection point
-                        boundary_point = min(
-                            intersection.geoms,
-                            key=lambda p: endpoint_point.distance(p)
-                        )
+        elif intersection.geom_type == 'LineString':
+            # Line segment intersection - take point closest to endpoint
+            coords = list(intersection.coords)
+            boundary_point = min(
+                [Point(c) for c in coords],
+                key=lambda p: endpoint_point.distance(p)
+            )
+        else:
+            # Fallback: use nearest boundary point
+            boundary_point = polygon.boundary.interpolate(
+                polygon.boundary.project(endpoint_point)
+            )
+    else:
+        # No intersection found, fallback to nearest boundary point
+        boundary_point = polygon.boundary.interpolate(
+            polygon.boundary.project(endpoint_point)
+        )
     
     return (boundary_point.x, boundary_point.y)
+
+
+def compute_stabilized_normals(
+    coords: List[Tuple[float, float]],
+    window_size: int = 5
+) -> List[Tuple[float, float]]:
+    """
+    Compute stabilized normal vectors using local PCA on sliding window.
+    Enforces consistent orientation (if dot(n_i, n_{i-1}) < 0, flip n_i).
+    
+    Args:
+        coords: List of (x, y) coordinates (should be smoothed)
+        window_size: Size of sliding window for PCA (default: 5)
+        
+    Returns:
+        List of normalized normal vectors (nx, ny) for each point
+    """
+    if len(coords) < 2:
+        return [(1.0, 0.0)] * len(coords)
+    
+    coords_array = np.array(coords)
+    normals = []
+    
+    for i in range(len(coords)):
+        # Determine window bounds
+        half_window = window_size // 2
+        start_idx = max(0, i - half_window)
+        end_idx = min(len(coords), i + half_window + 1)
+        
+        if end_idx - start_idx < 2:
+            # Fallback to central difference
+            if i == 0:
+                dx = coords[1][0] - coords[0][0]
+                dy = coords[1][1] - coords[0][1]
+            elif i == len(coords) - 1:
+                dx = coords[i][0] - coords[i-1][0]
+                dy = coords[i][1] - coords[i-1][1]
+            else:
+                dx = coords[i+1][0] - coords[i-1][0]
+                dy = coords[i+1][1] - coords[i-1][1]
+                dx /= 2.0
+                dy /= 2.0
+        else:
+            # Use local PCA on window
+            window_coords = coords_array[start_idx:end_idx]
+            # Center the window
+            center = np.mean(window_coords, axis=0)
+            centered = window_coords - center
+            
+            # Compute covariance matrix
+            if len(centered) >= 2:
+                cov = np.cov(centered.T)
+                # Get eigenvector (principal direction)
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                # Use eigenvector corresponding to largest eigenvalue (tangent direction)
+                if eigvals[1] > eigvals[0]:
+                    dx, dy = eigvecs[:, 1]
+                else:
+                    dx, dy = eigvecs[:, 0]
+            else:
+                # Fallback to central difference
+                if i == 0:
+                    dx = coords[1][0] - coords[0][0]
+                    dy = coords[1][1] - coords[0][1]
+                else:
+                    dx = coords[i][0] - coords[i-1][0]
+                    dy = coords[i][1] - coords[i-1][1]
+        
+        # Normalize
+        length = np.sqrt(dx*dx + dy*dy)
+        if length < 1e-6:
+            nx, ny = (1.0, 0.0)
+        else:
+            dx /= length
+            dy /= length
+            # Rotate 90 degrees to get normal (pointing right)
+            nx = -dy
+            ny = dx
+        
+        # Enforce consistent orientation
+        if i > 0:
+            prev_nx, prev_ny = normals[i-1]
+            dot = nx * prev_nx + ny * prev_ny
+            if dot < 0:
+                # Flip normal
+                nx = -nx
+                ny = -ny
+        
+        normals.append((nx, ny))
+    
+    return normals
 
 
 def compute_local_normal(
     coords: List[Tuple[float, float]],
     idx: int,
+    normals: Optional[List[Tuple[float, float]]] = None,
     epsilon: float = 1e-6
 ) -> Tuple[float, float]:
     """
@@ -101,9 +242,22 @@ def compute_local_normal(
         idx: Index of point to compute normal for
         epsilon: Small value for numerical stability
         
+    If normals are provided (from compute_stabilized_normals), use them.
+    Otherwise falls back to central difference method.
+    
+    Args:
+        coords: List of (x, y) coordinates
+        idx: Index of point to compute normal for
+        normals: Optional pre-computed stabilized normals
+        epsilon: Small value for numerical stability
+        
     Returns:
         Normalized normal vector (nx, ny) pointing to the right of the direction of travel
     """
+    if normals and idx < len(normals):
+        return normals[idx]
+    
+    # Fallback to original method
     if idx == 0:
         # Use forward direction
         dx = coords[1][0] - coords[0][0]
@@ -218,7 +372,8 @@ def find_boundary_intersections(
 def refine_centerline_midpoint(
     coords: List[Tuple[float, float]],
     polygon: Polygon,
-    search_distance: float = 10000.0
+    search_distance: float = 10000.0,
+    normals: Optional[List[Tuple[float, float]]] = None
 ) -> List[Tuple[float, float]]:
     """
     One iteration of midpoint refinement: for each point, project to midpoint of boundary intersections.
@@ -237,7 +392,7 @@ def refine_centerline_midpoint(
     refined = []
     for i in range(len(coords)):
         point = Point(coords[i])
-        normal = compute_local_normal(coords, i)
+        normal = compute_local_normal(coords, i, normals=normals)
         
         left_pt, right_pt = find_boundary_intersections(point, normal, polygon, search_distance)
         
@@ -253,6 +408,43 @@ def refine_centerline_midpoint(
             refined.append(coords[i])
     
     return refined
+
+
+def resample_polyline_by_arclength(
+    coords: List[Tuple[float, float]],
+    ds_um: float
+) -> List[Tuple[float, float]]:
+    """
+    Resample polyline uniformly by arc length.
+    
+    Args:
+        coords: List of (x, y) coordinates
+        ds_um: Target arc length step in micrometers
+        
+    Returns:
+        Resampled coordinates
+    """
+    if len(coords) < 2:
+        return coords
+    
+    line = LineString(coords)
+    total_length = line.length
+    
+    if total_length == 0:
+        return coords
+    
+    # Compute number of segments needed
+    num_segments = max(2, int(total_length / ds_um) + 1)
+    actual_ds = total_length / num_segments
+    
+    # Resample at uniform arc length intervals
+    resampled = []
+    for i in range(num_segments + 1):
+        s = i * actual_ds
+        point = line.interpolate(s)
+        resampled.append((point.x, point.y))
+    
+    return resampled
 
 
 def resample_polyline(
@@ -289,6 +481,50 @@ def resample_polyline(
         resampled.append((point.x, point.y))
     
     return resampled
+
+
+def smooth_polyline(
+    coords: List[Tuple[float, float]],
+    window_length: Optional[int] = None,
+    polyorder: int = 3
+) -> List[Tuple[float, float]]:
+    """
+    Smooth polyline using Savitzky-Golay filter on x(s) and y(s).
+    
+    Args:
+        coords: List of (x, y) coordinates
+        window_length: Window length for filter (default: auto 7-21 points)
+        polyorder: Polynomial order (default: 3)
+        
+    Returns:
+        Smoothed coordinates
+    """
+    if len(coords) < 3:
+        return coords
+    
+    # Auto-determine window length (7-21 points, must be odd)
+    if window_length is None:
+        window_length = min(21, max(7, len(coords) // 3))
+        if window_length % 2 == 0:
+            window_length += 1  # Must be odd
+        window_length = min(window_length, len(coords) - 1 if len(coords) % 2 == 0 else len(coords))
+    
+    if window_length < 3 or window_length >= len(coords):
+        return coords
+    
+    try:
+        coords_array = np.array(coords)
+        x = coords_array[:, 0]
+        y = coords_array[:, 1]
+        
+        # Apply Savitzky-Golay filter
+        x_smooth = savgol_filter(x, window_length, polyorder)
+        y_smooth = savgol_filter(y, window_length, polyorder)
+        
+        return list(zip(x_smooth, y_smooth))
+    except Exception as e:
+        logger.warning("Savitzky-Golay smoothing failed: %s, returning original coordinates", e)
+        return coords
 
 
 def spline_smooth_centerline(
@@ -331,7 +567,8 @@ def refine_centerline_with_boundary(
     num_iterations: int = 10,
     final_iterations: int = 3,
     resample_length: float = 10.0,
-    search_distance: float = 10000.0
+    search_distance: float = 10000.0,
+    um_per_px: float = 20.0
 ) -> List[Tuple[float, float]]:
     """
     Refine centerline coordinates using polygon boundary.
@@ -355,46 +592,37 @@ def refine_centerline_with_boundary(
     if len(coords) < 2:
         return coords
     
-    # Preserve start and end points (they're endpoints already snapped to boundary)
-    start_xy = coords[0]
-    end_xy = coords[-1]
     original_length = LineString(coords).length
     
-    refined = coords
+    # A) Initial smoothing and resampling to create band-limited coarse centerline
+    # Decouple skeleton from geometry - skeleton is topology only
+    ds_um = max(5.0, 1.0 * um_per_px)
+    refined = resample_polyline_by_arclength(coords, ds_um)
     
-    # Initial refinement iterations with resampling
+    # Smooth using Savitzky-Golay filter
+    if len(refined) >= 7:
+        refined = smooth_polyline(refined, window_length=None, polyorder=3)
+    
+    # B) Initial refinement iterations with stabilized normals
+    # Allow ALL points (including endpoints) to be refined to be equidistant from boundary
     for iteration in range(num_iterations):
-        refined = refine_centerline_midpoint(refined, polygon, search_distance)
+        # Compute stabilized normals from current refined curve
+        normals = compute_stabilized_normals(refined)
         
-        # Ensure endpoints are preserved
-        if len(refined) >= 2:
-            refined[0] = start_xy
-            refined[-1] = end_xy
+        # C) Refine using stabilized normals (midpoint projection)
+        # This makes all points equidistant from the polygon boundary
+        refined = refine_centerline_midpoint(refined, polygon, search_distance, normals=normals)
         
-        # Resample every few iterations to maintain uniform spacing
+        # Re-smooth and re-sample every few iterations to maintain stability
         if iteration % 3 == 0 and iteration > 0 and len(refined) > 2:
-            # Resample but preserve endpoints
-            resampled = resample_polyline(refined, resample_length)
-            if len(resampled) >= 2:
-                resampled[0] = start_xy
-                resampled[-1] = end_xy
-            refined = resampled
+            refined = resample_polyline_by_arclength(refined, ds_um)
+            if len(refined) >= 7:
+                refined = smooth_polyline(refined, window_length=None, polyorder=3)
     
-    # Spline smoothing (but preserve endpoints)
-    if len(refined) >= 4:
-        smoothed = spline_smooth_centerline(refined)
-        if len(smoothed) >= 2:
-            smoothed[0] = start_xy
-            smoothed[-1] = end_xy
-        refined = smoothed
-    
-    # Final refinement iterations
+    # Final refinement iterations with stabilized normals
+    normals = compute_stabilized_normals(refined)
     for iteration in range(final_iterations):
-        refined = refine_centerline_midpoint(refined, polygon, search_distance)
-        # Ensure endpoints are preserved
-        if len(refined) >= 2:
-            refined[0] = start_xy
-            refined[-1] = end_xy
+        refined = refine_centerline_midpoint(refined, polygon, search_distance, normals=normals)
     
     # Validate: check that length didn't increase dramatically
     final_length = LineString(refined).length
@@ -406,6 +634,168 @@ def refine_centerline_with_boundary(
     return refined
 
 
+def re_center_junctions(
+    nodes: List[Dict[str, Any]],
+    edges: List[Dict[str, Any]],
+    um_per_px: float,
+    tangent_estimation_distance: float = 50.0
+) -> None:
+    """
+    Re-center junction nodes (degree >= 3) by fitting best intersection point
+    of incident edge tangents using least-squares.
+    
+    This removes skeleton centroid bias and centers symmetric branches.
+    
+    Args:
+        nodes: List of node dictionaries (modified in place)
+        edges: List of edge dictionaries (modified in place)
+        um_per_px: Micrometers per pixel for distance calculations
+        tangent_estimation_distance: Distance along edge to estimate tangent (default: 50 µm)
+    """
+    # Build edge lookup by node
+    node_edges: Dict[str, List[Dict[str, Any]]] = {}
+    for edge in edges:
+        u, v = edge['u'], edge['v']
+        if u not in node_edges:
+            node_edges[u] = []
+        if v not in node_edges:
+            node_edges[v] = []
+        node_edges[u].append(edge)
+        node_edges[v].append(edge)
+    
+    for node in nodes:
+        # Only re-center junctions (degree >= 3)
+        if node['kind'] != 'junction':
+            continue
+        
+        node_id = node['id']
+        incident_edges = node_edges.get(node_id, [])
+        
+        if len(incident_edges) < 3:
+            continue  # Not a junction or already handled
+        
+        # Estimate tangent directions for each incident edge near the junction
+        tangents = []
+        points_on_lines = []
+        
+        for edge in incident_edges:
+            coords = edge['centerline']['coordinates']
+            if len(coords) < 2:
+                continue
+            
+            # Determine if this edge connects to the junction at start or end
+            if edge['u'] == node_id:
+                # Junction is at start, use direction from start to a point along edge
+                start_xy = coords[0]
+                # Find point at tangent_estimation_distance along edge
+                line = LineString(coords)
+                if line.length > tangent_estimation_distance:
+                    target_point = line.interpolate(tangent_estimation_distance)
+                    tangent_dx = target_point.x - start_xy[0]
+                    tangent_dy = target_point.y - start_xy[1]
+                    point_on_line = (start_xy[0], start_xy[1])
+                else:
+                    # Edge is too short, use direction from start to end
+                    if len(coords) > 1:
+                        tangent_dx = coords[-1][0] - start_xy[0]
+                        tangent_dy = coords[-1][1] - start_xy[1]
+                        point_on_line = (start_xy[0], start_xy[1])
+                    else:
+                        continue
+            else:  # edge['v'] == node_id
+                # Junction is at end, use direction from a point along edge to end
+                end_xy = coords[-1]
+                line = LineString(coords)
+                if line.length > tangent_estimation_distance:
+                    target_point = line.interpolate(line.length - tangent_estimation_distance)
+                    tangent_dx = end_xy[0] - target_point.x
+                    tangent_dy = end_xy[1] - target_point.y
+                    point_on_line = (end_xy[0], end_xy[1])
+                else:
+                    # Edge is too short, use direction from start to end
+                    if len(coords) > 1:
+                        tangent_dx = end_xy[0] - coords[0][0]
+                        tangent_dy = end_xy[1] - coords[0][1]
+                        point_on_line = (end_xy[0], end_xy[1])
+                    else:
+                        continue
+            
+            # Normalize tangent
+            length = np.sqrt(tangent_dx**2 + tangent_dy**2)
+            if length < 1e-6:
+                continue
+            
+            tangent_dx /= length
+            tangent_dy /= length
+            
+            tangents.append((tangent_dx, tangent_dy))
+            points_on_lines.append(point_on_line)
+        
+        if len(tangents) < 2:
+            continue  # Need at least 2 edges to find intersection
+        
+        # Fit best intersection point using least-squares
+        # For each pair of lines, find intersection, then average
+        
+        intersections = []
+        for i in range(len(tangents)):
+            for j in range(i + 1, len(tangents)):
+                t1, p1 = tangents[i], points_on_lines[i]
+                t2, p2 = tangents[j], points_on_lines[j]
+                
+                # Solve: p1 + s * t1 = p2 + u * t2
+                # Rearrange: s * t1 - u * t2 = p2 - p1
+                # Matrix form: [t1, -t2] * [s, u]^T = p2 - p1
+                
+                A = np.array([
+                    [t1[0], -t2[0]],
+                    [t1[1], -t2[1]]
+                ])
+                b = np.array([
+                    p2[0] - p1[0],
+                    p2[1] - p1[1]
+                ])
+                
+                try:
+                    sol, residuals, rank, s = lstsq(A, b, cond=1e-10)
+                    if rank == 2:  # Full rank, unique solution
+                        s_val = sol[0]
+                        intersection = (
+                            p1[0] + s_val * t1[0],
+                            p1[1] + s_val * t1[1]
+                        )
+                        intersections.append(intersection)
+                except:
+                    continue
+        
+        if len(intersections) == 0:
+            continue  # Couldn't find any intersections
+        
+        # Average intersection points
+        new_x = np.mean([p[0] for p in intersections])
+        new_y = np.mean([p[1] for p in intersections])
+        
+        # Update junction node position
+        old_xy = node['xy']
+        node['xy'] = [new_x, new_y]
+        
+        # Update incident edge centerline endpoints to match new junction position
+        for edge in incident_edges:
+            coords = edge['centerline']['coordinates']
+            if len(coords) < 2:
+                continue
+            
+            if edge['u'] == node_id:
+                # Junction is at start, update first coordinate
+                coords[0] = [new_x, new_y]
+            elif edge['v'] == node_id:
+                # Junction is at end, update last coordinate
+                coords[-1] = [new_x, new_y]
+        
+        logger.debug("Re-centered junction %s from (%g, %g) to (%g, %g)",
+                    node_id, old_xy[0], old_xy[1], new_x, new_y)
+
+
 def extract_graph_from_polygon(
     polygon: Any,  # Shapely Polygon
     um_per_px: Optional[float] = None,
@@ -415,7 +805,10 @@ def extract_graph_from_polygon(
     measure_edges: bool = True,
     default_height: float = 50.0,
     default_cross_section_kind: str = "rectangular",
-    per_edge_overrides: Optional[Dict[str, Dict[str, Any]]] = None
+    per_edge_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    min_channel_width: Optional[float] = None,
+    simplify_tolerance_factor: float = 0.5,
+    endpoint_merge_distance_factor: float = 1.0
 ) -> Dict[str, Any]:
     """
     Extract network graph from a polygon.
@@ -423,13 +816,16 @@ def extract_graph_from_polygon(
     Args:
         polygon: Shapely polygon
         um_per_px: Resolution for skeletonization (microns per pixel). If None, will be auto-tuned.
-        simplify_tolerance: Tolerance for path simplification. If None, auto-computed as 0.5 * um_per_px.
+        simplify_tolerance: Tolerance for path simplification. If None, computed as simplify_tolerance_factor * min_channel_width.
         auto_tune_resolution: If True and um_per_px is None, auto-tune resolution based on channel width
         width_sample_step: Distance between width samples along centerline (default: 10.0)
         measure_edges: If True, measure length and width profile for each edge (default: True)
         default_height: Default height in micrometers (default: 50.0)
         default_cross_section_kind: Default cross-section type (default: "rectangular")
         per_edge_overrides: Optional dict mapping edge_id to override dict
+        min_channel_width: Minimum channel width in micrometers. If None, will be estimated from polygon.
+        simplify_tolerance_factor: Factor to multiply min_channel_width for simplify_tolerance (default: 0.5)
+        endpoint_merge_distance_factor: Factor to multiply min_channel_width for endpoint merge distance (default: 1.0)
     
     Returns:
         Dictionary with:
@@ -454,14 +850,28 @@ def extract_graph_from_polygon(
             'skeleton_graph': skeleton_graph
         }
     
-    # Use transform's um_per_px to compute simplify_tolerance if not provided
+    um_per_px = transform.get('um_per_px', 20.0)
+    
+    # Estimate or use provided minimum channel width
+    if min_channel_width is None:
+        # Estimate from polygon using distance transform
+        from .skeleton import estimate_channel_width_and_resolution
+        estimated_width, _ = estimate_channel_width_and_resolution(
+            polygon,
+            coarse_um_per_px=min(um_per_px * 2, 30.0)  # Use coarser resolution for speed
+        )
+        min_channel_width = estimated_width
+        logger.debug("extract_graph_from_polygon: estimated min_channel_width=%.2f µm", min_channel_width)
+    else:
+        logger.debug("extract_graph_from_polygon: using provided min_channel_width=%.2f µm", min_channel_width)
+    
+    # Compute simplify_tolerance if not provided
     if simplify_tolerance is None:
-        simplify_tolerance = 0.5 * transform.get('um_per_px', 20.0)
-        logger.debug("extract_graph_from_polygon: computed simplify_tolerance=%.3f from um_per_px=%.3f",
-                     simplify_tolerance, transform.get('um_per_px', 20.0))
+        simplify_tolerance = simplify_tolerance_factor * min_channel_width
+        logger.debug("extract_graph_from_polygon: computed simplify_tolerance=%.3f (factor=%.2f × width=%.2f)",
+                     simplify_tolerance, simplify_tolerance_factor, min_channel_width)
     
     # A) Cluster junction pixels into connected components
-    um_per_px = transform.get('um_per_px', 20.0)
     import time
     start = time.time()
     
@@ -472,8 +882,10 @@ def extract_graph_from_polygon(
     endpoint_nodes = [n for n in skeleton_graph.nodes() if skeleton_graph.degree(n) == 1]
     logger.info(f"Found {len(endpoint_nodes)} endpoint pixels")
     
-    # B) Merge close endpoints
-    endpoint_merge_distance = 100.0  # 100 µm default
+    # B) Merge close endpoints using factor of minimum channel width
+    endpoint_merge_distance = endpoint_merge_distance_factor * min_channel_width
+    logger.debug("extract_graph_from_polygon: endpoint_merge_distance=%.2f µm (factor=%.2f × width=%.2f)",
+                 endpoint_merge_distance, endpoint_merge_distance_factor, min_channel_width)
     endpoint_clusters = merge_close_endpoints(skeleton_graph, endpoint_nodes, endpoint_merge_distance)
     logger.info(f"Merged {len(endpoint_nodes)} endpoints into {len(endpoint_clusters)} endpoint clusters")
     
@@ -510,12 +922,14 @@ def extract_graph_from_polygon(
             # Use the first node for direction finding
             endpoint_node_id = cluster_nodes[0]
         
-        # Snap endpoint to polygon boundary
+        # Snap endpoint to polygon boundary (initial snap, will be refined later)
+        # At this stage we don't have edge coordinates yet, so use skeleton direction
         snapped_xy = snap_endpoint_to_boundary(
             centroid,
             polygon,
             skeleton_graph,
-            endpoint_node_id
+            endpoint_node_id,
+            incident_edge_coords=None
         )
         
         node_id = f"N{node_counter}"
@@ -605,30 +1019,19 @@ def extract_graph_from_polygon(
                             path_coords_raw = [skeleton_graph.nodes[n]['xy'] for n in path_skeleton_nodes]
                             
                             # Refine centerline using polygon boundary (not raster coordinates)
+                            # Allow refinement to adjust ALL nodes to be equidistant from boundary
                             try:
-                                # Note: endpoints are already snapped to boundary, so preserve them
-                                start_xy = node1['xy'] if node1['kind'] == 'endpoint' else path_coords_raw[0]
-                                end_xy = node2['xy'] if node2['kind'] == 'endpoint' else path_coords_raw[-1]
-                                
-                                # Refine intermediate points only
-                                if len(path_coords_raw) > 2:
-                                    intermediate_coords = path_coords_raw[1:-1]
-                                    refined_intermediate = refine_centerline_with_boundary(
-                                        [start_xy] + intermediate_coords + [end_xy],
-                                        polygon,
-                                        num_iterations=10,
-                                        final_iterations=3,
-                                        resample_length=10.0,
-                                        search_distance=10000.0
-                                    )
-                                    # Ensure endpoints are preserved
-                                    if len(refined_intermediate) >= 2:
-                                        refined_intermediate[0] = start_xy
-                                        refined_intermediate[-1] = end_xy
-                                    path_coords = refined_intermediate
-                                else:
-                                    # Short edge, just use endpoints
-                                    path_coords = [start_xy, end_xy]
+                                # Refine entire path including endpoints
+                                refined_path = refine_centerline_with_boundary(
+                                    path_coords_raw,
+                                    polygon,
+                                    num_iterations=10,
+                                    final_iterations=3,
+                                    resample_length=10.0,
+                                    search_distance=10000.0,
+                                    um_per_px=um_per_px
+                                )
+                                path_coords = refined_path
                             except Exception as e:
                                 logger.warning("Centerline refinement failed for edge %s-%s: %s, using skeleton coordinates",
                                              node1['id'], node2['id'], e)
@@ -649,6 +1052,14 @@ def extract_graph_from_polygon(
                 if edge_key not in visited_edges:
                     edge_id = f"E{edge_counter}"
                     edge_counter += 1
+                    
+                    # Update node positions to match refined centerline endpoints
+                    # This ensures nodes are equidistant from the polygon boundary
+                    if len(path_coords) >= 2:
+                        # Update node1 position to match refined centerline start
+                        node1['xy'] = list(path_coords[0])
+                        # Update node2 position to match refined centerline end
+                        node2['xy'] = list(path_coords[-1])
                     
                     edges.append({
                         'id': edge_id,
@@ -734,6 +1145,14 @@ def extract_graph_from_polygon(
     
     if merged_node_ids:
         logger.info(f"  Merged {len(merged_node_ids)} close junctions")
+    
+    # D) Junction re-centering: fit best intersection point for symmetric branches
+    # Note: This should happen AFTER centerline refinement but BEFORE measurement
+    # so that junction positions are accurate for width profile calculations
+    junction_count = sum(1 for n in nodes if n['kind'] == 'junction')
+    if junction_count > 0:
+        logger.debug("Re-centering %d junction nodes using incident edge tangents", junction_count)
+        re_center_junctions(nodes, edges, um_per_px)
     
     # Measure edges (length and width profile)
     if measure_edges and edges:
@@ -909,35 +1328,34 @@ def extract_graph_from_polygon(
             node['kind'] = 'endpoint'
     
     # Snap ALL endpoint nodes to polygon boundary
+    # After refinement, endpoints are equidistant from boundary, but we want them precisely on the boundary
+    # Follow the edge tangent until it hits the polygon boundary
     for node in nodes:
         if node['kind'] == 'endpoint':
             endpoint_xy = tuple(node['xy'])
-            # Find direction from incident edge (if any)
+            # Find incident edge to get tangent direction
             incident_edges = [e for e in edges if e['u'] == node['id'] or e['v'] == node['id']]
             
-            # Try to find direction from edge
+            # Get edge coordinates for tangent direction
+            incident_edge_coords = None
             endpoint_node_id = None
-            if incident_edges:
-                # Use first incident edge to find direction
-                edge = incident_edges[0]
-                if edge['u'] == node['id']:
-                    # Node is at start of edge, direction is away from other node
-                    other_node = next((n for n in nodes if n['id'] == edge['v']), None)
-                else:
-                    # Node is at end of edge, direction is away from other node
-                    other_node = next((n for n in nodes if n['id'] == edge['u']), None)
-                
-                if other_node:
-                    # Use direction from other node to this node
-                    # This will be used in snap_endpoint_to_boundary
-                    pass
             
-            # Snap to boundary
+            if incident_edges:
+                # Use first incident edge to find tangent direction
+                edge = incident_edges[0]
+                incident_edge_coords = [tuple(c) for c in edge['centerline']['coordinates']]
+                
+                # Try to find skeleton node ID from cluster_nodes for fallback
+                if 'cluster_nodes' in node and node['cluster_nodes']:
+                    endpoint_node_id = node['cluster_nodes'][0]
+            
+            # Snap to boundary by following edge tangent
             snapped_xy = snap_endpoint_to_boundary(
                 endpoint_xy,
                 polygon,
                 skeleton_graph,
-                endpoint_node_id
+                endpoint_node_id,
+                incident_edge_coords=incident_edge_coords
             )
             
             # Update node coordinates
@@ -1004,7 +1422,10 @@ def extract_graph_from_polygons(
     circle_fit_rms_tol: float = 1.0,
     default_height: float = 50.0,
     default_cross_section_kind: str = "rectangular",
-    per_edge_overrides: Optional[Dict[str, Dict[str, Any]]] = None
+    per_edge_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    min_channel_width: Optional[float] = None,
+    simplify_tolerance_factor: float = 0.5,
+    endpoint_merge_distance_factor: float = 1.0
 ) -> Dict[str, Any]:
     """
     Extract network graph from multiple polygons (union first) and optionally detect ports.
@@ -1012,7 +1433,7 @@ def extract_graph_from_polygons(
     Args:
         polygons: List of polygon dicts with 'polygon' key containing GeoJSON
         um_per_px: Resolution for skeletonization (microns per pixel). If None, will be auto-tuned.
-        simplify_tolerance: Tolerance for path simplification. If None, auto-computed as 0.5 * um_per_px.
+        simplify_tolerance: Tolerance for path simplification. If None, computed as simplify_tolerance_factor * min_channel_width.
         auto_tune_resolution: If True and um_per_px is None, auto-tune resolution based on channel width
         width_sample_step: Distance between width samples along centerline (default: 10.0)
         measure_edges: If True, measure length and width profile for each edge (default: True)
@@ -1023,6 +1444,9 @@ def extract_graph_from_polygons(
         default_height: Default height in micrometers (default: 50.0)
         default_cross_section_kind: Default cross-section type: "rectangular" or "trapezoid" (default: "rectangular")
         per_edge_overrides: Optional dict mapping edge_id to override dict with height/cross_section_kind
+        min_channel_width: Minimum channel width in micrometers. If None, will be estimated from polygon.
+        simplify_tolerance_factor: Factor to multiply min_channel_width for simplify_tolerance (default: 0.5)
+        endpoint_merge_distance_factor: Factor to multiply min_channel_width for endpoint merge distance (default: 1.0)
     
     Returns:
         Dictionary with nodes, edges, and optionally ports
@@ -1060,7 +1484,10 @@ def extract_graph_from_polygons(
         measure_edges=measure_edges,
         default_height=default_height,
         default_cross_section_kind=default_cross_section_kind,
-        per_edge_overrides=per_edge_overrides
+        per_edge_overrides=per_edge_overrides,
+        min_channel_width=min_channel_width,
+        simplify_tolerance_factor=simplify_tolerance_factor,
+        endpoint_merge_distance_factor=endpoint_merge_distance_factor
     )
     
     # Optionally detect ports
