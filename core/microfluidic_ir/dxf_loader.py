@@ -4,26 +4,129 @@ import ezdxf
 from pathlib import Path
 from shapely.geometry import Polygon
 import hashlib
+from dataclasses import dataclass
+from typing import Optional, Any
+
 from datetime import datetime
 import logging
 
-logger = logging.getLogger(__name__)
+INSUNITS_TO_NAME = {
+    0:  "Unitless",
+    1:  "Inches",
+    2:  "Feet",
+    3:  "Miles",
+    4:  "Millimeters",
+    5:  "Centimeters",
+    6:  "Meters",
+    7:  "Kilometers",
+    8:  "Microinches",
+    9:  "Mils",
+    10: "Yards",
+    11: "Angstroms",
+    12: "Nanometers",
+    13: "Microns",
+    14: "Decimeters",
+    15: "Decameters",
+    16: "Hectometers",
+    17: "Gigameters",
+    18: "Astronomical Units",
+    19: "Light Years",
+    20: "Parsecs",
+}
+# Scale factor to meters for each INSUNITS value
+INSUNITS_TO_METERS = {
+    0:  None,           # Unitless → cannot infer safely
+    1:  0.0254,         # inches
+    2:  0.3048,         # feet
+    3:  1609.344,       # miles
+    4:  0.001,          # millimeters
+    5:  0.01,           # centimeters
+    6:  1.0,            # meters
+    7:  1000.0,         # kilometers
+    8:  0.0000254,      # microinches
+    9:  0.0000254,      # mils
+    10: 0.9144,         # yards
+    11: 1e-10,          # angstroms
+    12: 1e-9,           # nanometers
+    13: 1e-6,           # microns
+    14: 0.1,            # decimeters
+    15: 10.0,           # decameters
+    16: 100.0,          # hectometers
+    17: 1e9,            # gigameters
+    18: 1.495978707e11,# astronomical units
+    19: 9.4607e15,     # light years
+    20: 3.0857e16,     # parsecs
+}
 
+
+# ----------------------------
+# Result object
+# ----------------------------
+
+@dataclass
+class DrawingUnits:
+    insunits: int
+    name: str
+    meters_per_unit: Optional[float]
+    is_fallback: bool
+    warning: Optional[str]
+
+logger = logging.getLogger(__name__)
+def get_drawing_units(
+    doc: Any,  # ezdxf.Document
+    *,
+    fallback_insunits: int = 4,  # default fallback: millimeters
+) -> DrawingUnits:
+    """
+    Safely determine drawing units from an ezdxf document.
+
+    - Reads $INSUNITS
+    - Falls back if missing, zero, or invalid
+    - Returns scale factor to meters
+    """
+
+    raw_insunits = doc.header.get("$INSUNITS", 0)
+
+    if raw_insunits in INSUNITS_TO_NAME and raw_insunits != 0:
+        return DrawingUnits(
+            insunits=raw_insunits,
+            name=INSUNITS_TO_NAME[raw_insunits],
+            meters_per_unit=INSUNITS_TO_METERS[raw_insunits],
+            is_fallback=False,
+            warning=None,
+        )
+
+    # ---------- fallback ----------
+    fallback_name = INSUNITS_TO_NAME[fallback_insunits]
+    fallback_scale = INSUNITS_TO_METERS[fallback_insunits]
+
+    return DrawingUnits(
+        insunits=fallback_insunits,
+        name=fallback_name,
+        meters_per_unit=fallback_scale,
+        is_fallback=True,
+        warning=(
+            f"$INSUNITS is {raw_insunits!r} (unitless or invalid). "
+            f"Falling back to {fallback_name}."
+        ),
+    )
 
 def load_dxf(file_path: str, snap_close_tol: float = 2.0) -> dict:
     """
     Load DXF file and extract geometry.
     
+    All coordinates are converted from DXF drawing units to micrometers based on $INSUNITS.
+    
     Args:
         file_path: Path to DXF file
-        snap_close_tol: Tolerance for auto-closing nearly-closed polylines
+        snap_close_tol: Tolerance for auto-closing nearly-closed polylines (in original DXF units)
     
     Returns:
         Dictionary with:
         - layers: List of layer names
-        - polygons: List of polygon dicts with geometry and metadata
-        - circles: List of circle dicts with geometry and metadata
-        - bounds: Bounding box dict
+        - polygons: List of polygon dicts with geometry and metadata (coordinates in micrometers)
+        - circles: List of circle dicts with geometry and metadata (coordinates in micrometers)
+        - bounds: Bounding box dict (coordinates in micrometers)
         - source_hash: SHA256 hash of source file
     """
     path = Path(file_path)
@@ -40,8 +143,27 @@ def load_dxf(file_path: str, snap_close_tol: float = 2.0) -> dict:
     # Load DXF
     try:
         doc = ezdxf.readfile(file_path)
+        units = get_drawing_units(doc)
+        logger.debug(f"Units: {units}")
     except Exception as e:
+        logger.error(f"Failed to parse DXF file: {e}")
         raise ValueError(f"Failed to parse DXF file: {e}")
+    
+    # Convert DXF units to micrometers
+    # meters_per_unit gives conversion from DXF units to meters
+    # micrometers = DXF_coords × meters_per_unit × 1,000,000
+    if units.meters_per_unit is None:
+        raise ValueError(f"Cannot convert unitless DXF coordinates to micrometers. "
+                        f"$INSUNITS={units.insunits} is unitless.")
+    
+    scale_to_um = units.meters_per_unit * 1_000_000  # meters → micrometers
+    logger.debug(f"Converting DXF coordinates to micrometers: scale_factor={scale_to_um:.6f}")
+    if units.is_fallback:
+        logger.warning(f"Using fallback units: {units.name}. {units.warning}")
+    
+    # Convert snap_close_tol to micrometers as well
+    snap_close_tol_um = snap_close_tol * scale_to_um
+    logger.debug(f"snap_close_tol converted: {snap_close_tol} → {snap_close_tol_um:.3f} µm")
     
     msp = doc.modelspace()
     
@@ -63,24 +185,25 @@ def load_dxf(file_path: str, snap_close_tol: float = 2.0) -> dict:
             
             if entity.dxftype() == 'LWPOLYLINE':
                 # LWPOLYLINE has points directly
-                points = [(p[0], p[1]) for p in entity.get_points('xy')]
+                points = [(p[0] * scale_to_um, p[1] * scale_to_um) for p in entity.get_points('xy')]
                 is_closed = entity.closed
             else:
                 # POLYLINE - iterate vertices
                 for vertex in entity.vertices:
                     if vertex.dxftype() == 'VERTEX':
-                        points.append((vertex.dxf.location.x, vertex.dxf.location.y))
+                        points.append((vertex.dxf.location.x * scale_to_um, 
+                                      vertex.dxf.location.y * scale_to_um))
                 is_closed = entity.is_closed
             
             if len(points) < 3:
                 continue  # Skip degenerate polylines
             
-            # Check if nearly closed (snap-close)
-            if not is_closed and snap_close_tol > 0:
+            # Check if nearly closed (snap-close) - using scaled tolerance
+            if not is_closed and snap_close_tol_um > 0:
                 first = points[0]
                 last = points[-1]
                 dist = ((first[0] - last[0])**2 + (first[1] - last[1])**2)**0.5
-                if dist <= snap_close_tol:
+                if dist <= snap_close_tol_um:
                     is_closed = True
                     points.append(points[0])  # Close the loop
             
@@ -121,8 +244,8 @@ def load_dxf(file_path: str, snap_close_tol: float = 2.0) -> dict:
         
         # Handle circles
         elif entity.dxftype() == 'CIRCLE':
-            center = (entity.dxf.center.x, entity.dxf.center.y)
-            radius = entity.dxf.radius
+            center = (entity.dxf.center.x * scale_to_um, entity.dxf.center.y * scale_to_um)
+            radius = entity.dxf.radius * scale_to_um
             
             circles.append({
                 'circle': {
