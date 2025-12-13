@@ -31,108 +31,67 @@ def snap_endpoint_to_boundary(
     incident_edge_coords: Optional[List[Tuple[float, float]]] = None
 ) -> Tuple[float, float]:
     """
-    Snap an endpoint to the polygon boundary by following the edge tangent.
+    Snap an endpoint to the polygon boundary, positioned equidistant from the closest polygon vertices.
     
-    Extends a line from the endpoint along the tangent direction of the incident edge
-    until it intersects the polygon boundary.
+    Finds the two closest polygon vertices to the endpoint and positions the endpoint
+    at the midpoint between them, then projects it onto the polygon boundary.
     
     Args:
         endpoint_xy: Current endpoint coordinates (x, y)
         polygon: Shapely polygon
-        skeleton_graph: Skeleton graph (fallback for direction if edge coords not provided)
-        endpoint_node_id: Optional skeleton node ID (fallback for direction)
-        incident_edge_coords: Optional list of (x, y) coordinates of the incident edge centerline
+        skeleton_graph: Skeleton graph (unused, kept for compatibility)
+        endpoint_node_id: Optional skeleton node ID (unused, kept for compatibility)
+        incident_edge_coords: Optional list of (x, y) coordinates (unused, kept for compatibility)
         
     Returns:
-        Snapped coordinates (x, y) on polygon boundary
+        Snapped coordinates (x, y) on polygon boundary, equidistant from closest vertices
     """
     endpoint_point = Point(endpoint_xy)
     
-    # Determine tangent direction from incident edge
-    tangent_direction = None
+    # Get all polygon vertices (exterior coordinates)
+    exterior_coords = list(polygon.exterior.coords)
+    # Remove duplicate last point if polygon is closed
+    if len(exterior_coords) > 1 and exterior_coords[0] == exterior_coords[-1]:
+        exterior_coords = exterior_coords[:-1]
     
-    if incident_edge_coords and len(incident_edge_coords) >= 2:
-        # Use the incident edge to determine tangent direction
-        # Check if endpoint is at start or end of edge
-        start_dist = ((incident_edge_coords[0][0] - endpoint_xy[0])**2 + 
-                     (incident_edge_coords[0][1] - endpoint_xy[1])**2)**0.5
-        end_dist = ((incident_edge_coords[-1][0] - endpoint_xy[0])**2 + 
-                   (incident_edge_coords[-1][1] - endpoint_xy[1])**2)**0.5
-        
-        if start_dist < end_dist:
-            # Endpoint is at start of edge, extend in opposite direction (towards boundary)
-            # Use direction from first to second point, then reverse
-            dx = incident_edge_coords[0][0] - incident_edge_coords[1][0]
-            dy = incident_edge_coords[0][1] - incident_edge_coords[1][1]
-        else:
-            # Endpoint is at end of edge, extend in forward direction (towards boundary)
-            # Use direction from second-to-last to last point
-            dx = incident_edge_coords[-1][0] - incident_edge_coords[-2][0]
-            dy = incident_edge_coords[-1][1] - incident_edge_coords[-2][1]
-        
-        # Normalize direction
-        length = (dx**2 + dy**2)**0.5
-        if length > 1e-6:
-            tangent_direction = (dx / length, dy / length)
-    
-    # Fallback: use skeleton graph to find direction
-    if tangent_direction is None and endpoint_node_id is not None and endpoint_node_id in skeleton_graph:
-        neighbors = list(skeleton_graph.neighbors(endpoint_node_id))
-        if neighbors:
-            # Get direction from endpoint to its neighbor
-            neighbor_xy = skeleton_graph.nodes[neighbors[0]]['xy']
-            dx = endpoint_xy[0] - neighbor_xy[0]
-            dy = endpoint_xy[1] - neighbor_xy[1]
-            # Normalize direction (reverse because we want direction away from neighbor)
-            length = (dx**2 + dy**2)**0.5
-            if length > 1e-6:
-                tangent_direction = (-dx / length, -dy / length)
-    
-    # Final fallback: use nearest boundary point projection
-    if tangent_direction is None:
+    if len(exterior_coords) < 2:
+        # Fallback: use nearest boundary point projection
         boundary_point = polygon.boundary.interpolate(
             polygon.boundary.project(endpoint_point)
         )
         return (boundary_point.x, boundary_point.y)
     
-    # Extend line from endpoint along tangent direction until it hits boundary
-    # Use a long extension distance to ensure we hit the boundary
-    extension_distance = 10000.0  # 10mm should be enough for most cases
-    extended_point = Point(
-        endpoint_xy[0] + tangent_direction[0] * extension_distance,
-        endpoint_xy[1] + tangent_direction[1] * extension_distance
-    )
-    line = LineString([endpoint_point, extended_point])
+    # Find distances to all vertices
+    vertex_distances = []
+    for i, vertex_coord in enumerate(exterior_coords):
+        vertex_point = Point(vertex_coord)
+        dist = endpoint_point.distance(vertex_point)
+        vertex_distances.append((i, vertex_coord, dist))
     
-    # Find intersection with polygon boundary
-    intersection = polygon.boundary.intersection(line)
+    # Sort by distance and get the two closest vertices
+    vertex_distances.sort(key=lambda x: x[2])
     
-    if intersection and not intersection.is_empty:
-        if intersection.geom_type == 'Point':
-            boundary_point = intersection
-        elif intersection.geom_type == 'MultiPoint' and len(intersection.geoms) > 0:
-            # Take closest intersection point to endpoint
-            boundary_point = min(
-                intersection.geoms,
-                key=lambda p: endpoint_point.distance(p)
-            )
-        elif intersection.geom_type == 'LineString':
-            # Line segment intersection - take point closest to endpoint
-            coords = list(intersection.coords)
-            boundary_point = min(
-                [Point(c) for c in coords],
-                key=lambda p: endpoint_point.distance(p)
-            )
-        else:
-            # Fallback: use nearest boundary point
-            boundary_point = polygon.boundary.interpolate(
-                polygon.boundary.project(endpoint_point)
-            )
-    else:
-        # No intersection found, fallback to nearest boundary point
+    if len(vertex_distances) < 2:
+        # Only one vertex, use nearest boundary point
         boundary_point = polygon.boundary.interpolate(
             polygon.boundary.project(endpoint_point)
         )
+        return (boundary_point.x, boundary_point.y)
+    
+    # Get the two closest vertices
+    closest_vertex1 = Point(vertex_distances[0][1])
+    closest_vertex2 = Point(vertex_distances[1][1])
+    
+    # Compute midpoint between the two closest vertices
+    midpoint = Point(
+        (closest_vertex1.x + closest_vertex2.x) / 2.0,
+        (closest_vertex1.y + closest_vertex2.y) / 2.0
+    )
+    
+    # Project midpoint onto polygon boundary
+    boundary_point = polygon.boundary.interpolate(
+        polygon.boundary.project(midpoint)
+    )
     
     return (boundary_point.x, boundary_point.y)
 
