@@ -44,4 +44,5 @@ Thumbs.db
 # Project specific
 *.dxf
 temp_workspaces/
+.mplconfig/
 

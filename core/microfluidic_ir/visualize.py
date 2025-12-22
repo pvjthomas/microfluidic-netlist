@@ -20,13 +20,13 @@ class PipelineVisualizer:
     """Interactive visualization of pipeline steps A, B, C, D."""
     
     def __init__(self):
-        self.current_step = 0  # 0=A, 1=B, 2=C, 3=D
+        self.current_step = 0  # 0=A, 1=B, 2=C, 3=C2, 4=D
         self.fig = None
         self.ax = None
         self.data = {}  # Store data for each step
         self.computed_steps = set()  # Track which steps have been computed
         self.compute_params = {}  # Store parameters needed to compute steps C and D
-        self.enabled_steps = {'A': True, 'B': True, 'C': True, 'D': True}  # Which steps are enabled
+        self.enabled_steps = {'A': True, 'B': True, 'C': True, 'C2': True, 'D': True}  # Which steps are enabled
         self.original_bounds = {}  # Store original bounds for each step for zoom to fit
         self.rect_selector = None  # Rectangle selector for zoom to area
         
@@ -52,6 +52,17 @@ class PipelineVisualizer:
             'polygon': polygon
         }
     
+    def set_step_c2(self, skeleton_graph, junction_clusters: Dict[int, List[int]], 
+                   endpoint_clusters: Dict[int, List[int]], forbidden_nodes: set, polygon: Polygon):
+        """Step C2: Topology-aware endpoint merging."""
+        self.data['C2'] = {
+            'skeleton_graph': skeleton_graph,
+            'junction_clusters': junction_clusters,
+            'endpoint_clusters': endpoint_clusters,
+            'forbidden_nodes': forbidden_nodes,
+            'polygon': polygon
+        }
+    
     def set_step_d(self, nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]], 
                    polygon: Polygon):
         """Step D: Final graph with nodes and edges."""
@@ -63,7 +74,7 @@ class PipelineVisualizer:
     
     def _draw_step_a(self):
         """Draw Step A: DXF polygons and circles."""
-        self.ax.clear()
+        self.ax.cla()  # Faster than clear() - doesn't reset all properties
         self.ax.set_title('Step A: DXF Import & Normalization', fontsize=14, fontweight='bold')
         
         data = self.data.get('A', {})
@@ -114,7 +125,7 @@ class PipelineVisualizer:
     
     def _draw_step_b(self):
         """Draw Step B: Selected channel regions."""
-        self.ax.clear()
+        self.ax.cla()  # Faster than clear() - doesn't reset all properties
         self.ax.set_title('Step B: Channel Region Selection', fontsize=14, fontweight='bold')
         
         data = self.data.get('B', {})
@@ -186,7 +197,7 @@ class PipelineVisualizer:
     
     def _draw_step_c(self):
         """Draw Step C: Skeleton (medial axis)."""
-        self.ax.clear()
+        self.ax.cla()  # Faster than clear() - doesn't reset all properties
         
         # Check if step is computed
         if 'C' not in self.computed_steps:
@@ -197,7 +208,7 @@ class PipelineVisualizer:
                         fontsize=12, bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
             self.ax.set_xlim(0, 1)
             self.ax.set_ylim(0, 1)
-            self.fig.canvas.draw()
+            self.fig.canvas.draw_idle()
             return
         
         self.ax.set_title('Step C: Skeleton Extraction (Medial Axis)', 
@@ -259,7 +270,9 @@ class PipelineVisualizer:
         
         # Draw skeleton graph
         if skeleton_graph and len(skeleton_graph) > 0:
-            # Draw edges - use polyline data if available (vector graph), otherwise draw straight lines
+            # Batch edge plotting for performance
+            edge_lines_x = []
+            edge_lines_y = []
             for u, v in skeleton_graph.edges():
                 edge_data = skeleton_graph.edges[u, v]
                 polyline = edge_data.get('polyline')
@@ -268,29 +281,62 @@ class PipelineVisualizer:
                     # Use polyline geometry from vector graph
                     xs = [p[0] for p in polyline]
                     ys = [p[1] for p in polyline]
-                    self.ax.plot(xs, ys, 'b-', linewidth=1.5, alpha=0.7)
+                    edge_lines_x.append(xs)
+                    edge_lines_y.append(ys)
                 else:
                     # Fallback: draw straight line between nodes
                     u_xy = skeleton_graph.nodes[u]['xy']
                     v_xy = skeleton_graph.nodes[v]['xy']
-                    self.ax.plot([u_xy[0], v_xy[0]], [u_xy[1], v_xy[1]],
-                               'b-', linewidth=1, alpha=0.6)
+                    edge_lines_x.append([u_xy[0], v_xy[0]])
+                    edge_lines_y.append([u_xy[1], v_xy[1]])
             
-            # Draw nodes with different colors for junctions vs endpoints
+            # Plot all edges at once
+            if edge_lines_x:
+                for xs, ys in zip(edge_lines_x, edge_lines_y):
+                    self.ax.plot(xs, ys, 'b-', linewidth=1.5, alpha=0.7)
+            
+            # Batch node plotting for performance - compute degrees once
+            degrees = dict(skeleton_graph.degree())
+            junction_x, junction_y = [], []
+            endpoint_x, endpoint_y = [], []
+            intermediate_x, intermediate_y = [], []
+            
             for node_id in skeleton_graph.nodes():
                 xy = skeleton_graph.nodes[node_id]['xy']
-                degree = skeleton_graph.degree(node_id)
+                degree = degrees.get(node_id, 0)
                 if degree >= 3:
-                    # Junction
-                    self.ax.plot(xy[0], xy[1], 'ro', markersize=8, 
-                               markeredgecolor='darkred', markeredgewidth=1)
+                    junction_x.append(xy[0])
+                    junction_y.append(xy[1])
                 elif degree == 1:
-                    # Endpoint
-                    self.ax.plot(xy[0], xy[1], 'go', markersize=6,
-                               markeredgecolor='darkgreen', markeredgewidth=1)
+                    endpoint_x.append(xy[0])
+                    endpoint_y.append(xy[1])
                 else:
-                    # Intermediate
-                    self.ax.plot(xy[0], xy[1], 'bo', markersize=4, alpha=0.5)
+                    intermediate_x.append(xy[0])
+                    intermediate_y.append(xy[1])
+            
+            # Plot all nodes of each type at once
+            if junction_x:
+                self.ax.plot(junction_x, junction_y, 'ro', markersize=8, 
+                           markeredgecolor='darkred', markeredgewidth=1, linestyle='None')
+            if endpoint_x:
+                self.ax.plot(endpoint_x, endpoint_y, 'go', markersize=6,
+                           markeredgecolor='darkgreen', markeredgewidth=1, linestyle='None')
+            if intermediate_x:
+                self.ax.plot(intermediate_x, intermediate_y, 'bo', markersize=4, 
+                           alpha=0.5, linestyle='None')
+            
+            # Add legend for node colors
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='red', 
+                      markeredgecolor='darkred', markersize=8, markeredgewidth=1, label='Junction (degree ≥ 3)'),
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='green', 
+                      markeredgecolor='darkgreen', markersize=6, markeredgewidth=1, label='Endpoint (degree = 1)'),
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', 
+                      markersize=4, alpha=0.5, label='Intermediate (degree = 2)')
+            ]
+            self.ax.legend(handles=legend_elements, loc='upper right', fontsize=9, 
+                          framealpha=0.9, edgecolor='black')
         
         # Set bounds
         if polygon:
@@ -317,10 +363,225 @@ class PipelineVisualizer:
             self.ax.text(0.02, 0.98, info, transform=self.ax.transAxes,
                         verticalalignment='top', bbox=dict(boxstyle='round',
                         facecolor='wheat', alpha=0.5), fontsize=10)
+        
+        # Use draw_idle for better performance (batches redraws)
+        self.fig.canvas.draw_idle()
+    
+    def _draw_step_c2(self):
+        """Draw Step C2: Topology-aware endpoint merging."""
+        self.ax.cla()  # Faster than clear() - doesn't reset all properties
+        
+        # Check if step is computed
+        if 'C2' not in self.computed_steps:
+            self.ax.set_title('Step C2: Endpoint Merging (Click Next to compute)', 
+                             fontsize=14, fontweight='bold')
+            self.ax.text(0.5, 0.5, 'Step C2 not yet computed.\nClick "Next →" to compute and display.',
+                        transform=self.ax.transAxes, ha='center', va='center',
+                        fontsize=12, bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+            self.ax.set_xlim(0, 1)
+            self.ax.set_ylim(0, 1)
+            self.fig.canvas.draw_idle()
+            return
+        
+        self.ax.set_title('Step C2: Topology-Aware Endpoint Merging', 
+                         fontsize=14, fontweight='bold')
+        
+        data = self.data.get('C2', {})
+        skeleton_graph = data.get('skeleton_graph')
+        junction_clusters = data.get('junction_clusters', {})
+        endpoint_clusters = data.get('endpoint_clusters', {})
+        forbidden_nodes = data.get('forbidden_nodes', set())
+        polygon = data.get('polygon')
+        
+        # Draw the shaded region from Step B (selected polygons)
+        step_b_data = self.data.get('B', {})
+        selected_polygons = step_b_data.get('selected_polygons', [])
+        
+        for poly_data in selected_polygons:
+            coords_list = poly_data['polygon']['coordinates']
+            if not coords_list:
+                continue
+                
+            # Build compound path with exterior and holes
+            path_vertices = []
+            path_codes = []
+            
+            # Process each ring (exterior is ring 0, holes are rings 1..N)
+            for ring_coords in coords_list:
+                if len(ring_coords) < 3:
+                    continue
+                
+                # Convert to numpy array for easier manipulation
+                ring_array = np.array(ring_coords)
+                
+                # Add vertices: all ring points
+                path_vertices.extend(ring_array)
+                
+                # Add codes: MOVETO for first point, LINETO for rest
+                path_codes.append(Path.MOVETO)
+                path_codes.extend([Path.LINETO] * (len(ring_array) - 1))
+                
+                # CLOSEPOLY requires a matching vertex (dummy vertex, typically (0,0))
+                path_codes.append(Path.CLOSEPOLY)
+                path_vertices.append([0.0, 0.0])  # Dummy vertex for CLOSEPOLY
+            
+            if path_vertices:
+                # Create compound path
+                compound_path = Path(np.array(path_vertices), path_codes)
+                
+                # Create PathPatch with styling
+                patch = PathPatch(compound_path,
+                                facecolor='lightgreen', edgecolor='darkgreen',
+                                alpha=0.5, linewidth=1.5, linestyle='--')
+                self.ax.add_patch(patch)
+        
+        # Draw skeleton graph edges
+        if skeleton_graph and len(skeleton_graph) > 0:
+            # Batch edge plotting for performance
+            edge_lines_x = []
+            edge_lines_y = []
+            for u, v in skeleton_graph.edges():
+                edge_data = skeleton_graph.edges[u, v]
+                polyline = edge_data.get('polyline')
+                
+                if polyline and len(polyline) >= 2:
+                    # Use polyline geometry from vector graph
+                    xs = [p[0] for p in polyline]
+                    ys = [p[1] for p in polyline]
+                    edge_lines_x.append(xs)
+                    edge_lines_y.append(ys)
+                else:
+                    # Fallback: draw straight line between nodes
+                    u_xy = skeleton_graph.nodes[u]['xy']
+                    v_xy = skeleton_graph.nodes[v]['xy']
+                    edge_lines_x.append([u_xy[0], v_xy[0]])
+                    edge_lines_y.append([u_xy[1], v_xy[1]])
+            
+            # Plot all edges at once
+            if edge_lines_x:
+                for xs, ys in zip(edge_lines_x, edge_lines_y):
+                    self.ax.plot(xs, ys, 'b-', linewidth=1.5, alpha=0.7)
+            
+            # Batch node plotting for performance
+            degrees = dict(skeleton_graph.degree())
+            
+            # Collect junction nodes
+            junction_x, junction_y = [], []
+            for cluster_nodes in junction_clusters.values():
+                for node_id in cluster_nodes:
+                    if node_id in skeleton_graph:
+                        xy = skeleton_graph.nodes[node_id]['xy']
+                        junction_x.append(xy[0])
+                        junction_y.append(xy[1])
+            
+            # Collect endpoint nodes (including merged clusters)
+            endpoint_x, endpoint_y = [], []
+            endpoint_centroid_x, endpoint_centroid_y = [], []
+            endpoint_single_x, endpoint_single_y = [], []
+            
+            for cluster_nodes in endpoint_clusters.values():
+                if len(cluster_nodes) == 1:
+                    node_id = cluster_nodes[0]
+                    if node_id in skeleton_graph:
+                        xy = skeleton_graph.nodes[node_id]['xy']
+                        endpoint_single_x.append(xy[0])
+                        endpoint_single_y.append(xy[1])
+                else:
+                    # Collect all nodes in cluster for centroid
+                    cluster_xy = []
+                    for node_id in cluster_nodes:
+                        if node_id in skeleton_graph:
+                            xy = skeleton_graph.nodes[node_id]['xy']
+                            cluster_xy.append(xy)
+                            endpoint_x.append(xy[0])
+                            endpoint_y.append(xy[1])
+                    # Compute centroid
+                    if cluster_xy:
+                        centroid_x = sum(c[0] for c in cluster_xy) / len(cluster_xy)
+                        centroid_y = sum(c[1] for c in cluster_xy) / len(cluster_xy)
+                        endpoint_centroid_x.append(centroid_x)
+                        endpoint_centroid_y.append(centroid_y)
+            
+            # Collect intermediate nodes
+            intermediate_x, intermediate_y = [], []
+            endpoint_set = set()
+            for cluster_nodes in endpoint_clusters.values():
+                endpoint_set.update(cluster_nodes)
+            junction_set = set()
+            for cluster_nodes in junction_clusters.values():
+                junction_set.update(cluster_nodes)
+            
+            for node_id in skeleton_graph.nodes():
+                if node_id in forbidden_nodes or node_id in endpoint_set or node_id in junction_set:
+                    continue
+                degree = degrees.get(node_id, 0)
+                if degree == 2:
+                    xy = skeleton_graph.nodes[node_id]['xy']
+                    intermediate_x.append(xy[0])
+                    intermediate_y.append(xy[1])
+            
+            # Plot all nodes of each type at once
+            if junction_x:
+                self.ax.plot(junction_x, junction_y, 'ro', markersize=8, 
+                           markeredgecolor='darkred', markeredgewidth=1, linestyle='None')
+            if endpoint_x:
+                self.ax.plot(endpoint_x, endpoint_y, 'go', markersize=6,
+                           markeredgecolor='darkgreen', markeredgewidth=1, alpha=0.6, linestyle='None')
+            if endpoint_single_x:
+                self.ax.plot(endpoint_single_x, endpoint_single_y, 'go', markersize=6,
+                           markeredgecolor='darkgreen', markeredgewidth=1, linestyle='None')
+            if endpoint_centroid_x:
+                self.ax.plot(endpoint_centroid_x, endpoint_centroid_y, 'go', markersize=10,
+                           markeredgecolor='darkgreen', markeredgewidth=2, linestyle='None')
+            if intermediate_x:
+                self.ax.plot(intermediate_x, intermediate_y, 'bo', markersize=4, 
+                           alpha=0.5, linestyle='None')
+            
+            # Add legend for node colors
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='red', 
+                      markeredgecolor='darkred', markersize=8, markeredgewidth=1, label='Junction (degree ≥ 3)'),
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='green', 
+                      markeredgecolor='darkgreen', markersize=6, markeredgewidth=1, label='Endpoint (degree = 1)'),
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', 
+                      markersize=4, alpha=0.5, label='Intermediate (degree = 2)')
+            ]
+            self.ax.legend(handles=legend_elements, loc='upper right', fontsize=9, 
+                          framealpha=0.9, edgecolor='black')
+        
+        # Set bounds
+        if polygon:
+            bounds = polygon.bounds
+            margin = max(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.1
+            xmin = bounds[0] - margin
+            xmax = bounds[2] + margin
+            ymin = bounds[1] - margin
+            ymax = bounds[3] + margin
+            self.ax.set_xlim(xmin, xmax)
+            self.ax.set_ylim(ymin, ymax)
+            # Store original bounds for zoom to fit
+            self.original_bounds['C2'] = {'xmin': xmin, 'ymin': ymin, 'xmax': xmax, 'ymax': ymax}
+        
+        self.ax.set_aspect('equal')
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_xlabel('X (µm)')
+        self.ax.set_ylabel('Y (µm)')
+        
+        if skeleton_graph:
+            junction_count = sum(len(v) for v in junction_clusters.values())
+            endpoint_count = sum(len(v) for v in endpoint_clusters.values())
+            info = f"Junctions: {len(junction_clusters)} clusters ({junction_count} pixels), Endpoints: {len(endpoint_clusters)} clusters ({endpoint_count} pixels)"
+            self.ax.text(0.02, 0.98, info, transform=self.ax.transAxes,
+                        verticalalignment='top', bbox=dict(boxstyle='round',
+                        facecolor='wheat', alpha=0.5), fontsize=10)
+        
+        # Use draw_idle for better performance (batches redraws)
+        self.fig.canvas.draw_idle()
     
     def _draw_step_d(self):
         """Draw Step D: Final graph with nodes and edges."""
-        self.ax.clear()
+        self.ax.cla()  # Faster than clear() - doesn't reset all properties
         
         # Check if step is computed
         if 'D' not in self.computed_steps:
@@ -331,7 +592,7 @@ class PipelineVisualizer:
                         fontsize=12, bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
             self.ax.set_xlim(0, 1)
             self.ax.set_ylim(0, 1)
-            self.fig.canvas.draw()
+            self.fig.canvas.draw_idle()
             return
         
         self.ax.set_title('Step D: Final Graph (Nodes & Edges)', 
@@ -425,20 +686,20 @@ class PipelineVisualizer:
         if self.rect_selector is not None:
             self.rect_selector.set_active(False)
         
-        step_names = ['A', 'B', 'C', 'D']
+        step_names = ['A', 'B', 'C', 'C2', 'D']
         step_name = step_names[self.current_step]
         
         # Check if step is enabled
         if not self.enabled_steps.get(step_name, False):
             # Show disabled message
-            self.ax.clear()
+            self.ax.cla()  # Faster than clear() - doesn't reset all properties
             self.ax.set_title(f'Step {step_name}: Disabled', fontsize=14, fontweight='bold')
             self.ax.text(0.5, 0.5, f'Step {step_name} is disabled.',
                         transform=self.ax.transAxes, ha='center', va='center',
                         fontsize=12, bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
             self.ax.set_xlim(0, 1)
             self.ax.set_ylim(0, 1)
-            self.fig.canvas.draw()
+            self.fig.canvas.draw_idle()
             return
         
         if step_name == 'A':
@@ -447,14 +708,17 @@ class PipelineVisualizer:
             self._draw_step_b()
         elif step_name == 'C':
             self._draw_step_c()
+        elif step_name == 'C2':
+            self._draw_step_c2()
         elif step_name == 'D':
             self._draw_step_d()
         
-        self.fig.canvas.draw()
+        # Use draw_idle for better performance (batches redraws)
+        self.fig.canvas.draw_idle()
     
     def _prev_step(self, event):
         """Navigate to previous enabled step."""
-        step_names = ['A', 'B', 'C', 'D']
+        step_names = ['A', 'B', 'C', 'C2', 'D']
         # Find previous enabled step
         for i in range(self.current_step - 1, -1, -1):
             if self.enabled_steps.get(step_names[i], False):
@@ -464,9 +728,9 @@ class PipelineVisualizer:
     
     def _next_step(self, event):
         """Navigate to next enabled step, computing it if necessary."""
-        step_names = ['A', 'B', 'C', 'D']
+        step_names = ['A', 'B', 'C', 'C2', 'D']
         # Find next enabled step
-        for i in range(self.current_step + 1, 4):
+        for i in range(self.current_step + 1, 5):
             step_name = step_names[i]
             if not self.enabled_steps.get(step_name, False):
                 continue
@@ -475,6 +739,10 @@ class PipelineVisualizer:
             if step_name not in self.computed_steps:
                 if step_name == 'C' and self.enabled_steps.get('C', False):
                     self._compute_step_c()
+                elif step_name == 'C2' and self.enabled_steps.get('C2', False):
+                    # C2 is computed as part of step D
+                    if 'D' not in self.computed_steps:
+                        self._compute_step_d()
                 elif step_name == 'D' and self.enabled_steps.get('D', False):
                     self._compute_step_d()
             
@@ -746,6 +1014,18 @@ class PipelineVisualizer:
             t1 = time.time()
             print(f"  [Step D] Extract full graph: {t1 - t0:.3f}s")
             
+            # Store Step C2 data (topology-aware endpoint merging)
+            c2_data = graph_result.get('c2_data')
+            if c2_data:
+                self.set_step_c2(
+                    c2_data['skeleton_graph'],
+                    c2_data['junction_clusters'],
+                    c2_data['endpoint_clusters'],
+                    c2_data['forbidden_nodes'],
+                    c2_data['polygon']
+                )
+                self.computed_steps.add('C2')
+            
             # Store Step D data
             self.data['D'] = {
                 'nodes': graph_result.get('nodes', []),
@@ -798,7 +1078,7 @@ class PipelineVisualizer:
         """Zoom to fit the original bounds of the current step."""
         if self.ax is None:
             return
-        step_names = ['A', 'B', 'C', 'D']
+        step_names = ['A', 'B', 'C', 'C2', 'D']
         step_name = step_names[self.current_step]
         bounds = self.original_bounds.get(step_name)
         if bounds:
@@ -875,7 +1155,7 @@ class PipelineVisualizer:
         btn_zoom_area.on_clicked(self._enable_zoom_to_area)
         
         # Find first enabled step
-        step_names = ['A', 'B', 'C', 'D']
+        step_names = ['A', 'B', 'C', 'C2', 'D']
         for i, step_name in enumerate(step_names):
             if self.enabled_steps.get(step_name, False):
                 self.current_step = i

@@ -1366,23 +1366,67 @@ def compute_cluster_centroid(
 def merge_close_endpoints(
     skeleton_graph: nx.Graph,
     endpoint_nodes: List[int],
-    merge_distance_um: float = 100.0
+    merge_distance_um: float = 100.0,
+    um_per_px: Optional[float] = None,
+    forbidden_nodes: Optional[set] = None
 ) -> Dict[int, List[int]]:
     """
-    Merge endpoints that are spatially close.
+    Merge endpoints that are topologically close (using graph-shortest-path).
+    
+    Only merges endpoints if:
+    - Both have degree==1
+    - Graph-shortest-path length is small
+    - Path contains only degree-2 nodes (no junction pixels)
+    - Not within 2 px of forbidden nodes (junction pixels)
     
     Args:
         skeleton_graph: NetworkX graph
         endpoint_nodes: List of endpoint node IDs
         merge_distance_um: Maximum distance to merge endpoints (micrometers)
+        um_per_px: Resolution (microns per pixel) for pixel-based distance checks
+        forbidden_nodes: Set of forbidden node IDs (junction pixels) to avoid
         
     Returns:
         Dict mapping merged_id to list of node IDs merged together
     """
+    import math
+    
     if len(endpoint_nodes) < 2:
         return {i: [n] for i, n in enumerate(endpoint_nodes)}
     
-    # Build distance matrix and merge close endpoints
+    if forbidden_nodes is None:
+        forbidden_nodes = set()
+    
+    # Compute degrees once
+    degrees = dict(skeleton_graph.degree())
+    
+    # Convert merge distance to graph path length (in pixels)
+    # K = ceil(merge_distance_um / um_per_px)
+    if um_per_px is not None and um_per_px > 0:
+        K = int(math.ceil(merge_distance_um / um_per_px))
+    else:
+        # Fallback: use large value if um_per_px not provided
+        K = 1000
+    
+    # Build forbidden set with 2 px guard zone
+    forbidden_with_guard = set(forbidden_nodes)
+    if um_per_px is not None and um_per_px > 0 and forbidden_nodes:
+        guard_distance_um = 2.0 * um_per_px
+        for forbidden_node in forbidden_nodes:
+            if forbidden_node not in skeleton_graph:
+                continue
+            forbidden_xy = skeleton_graph.nodes[forbidden_node]['xy']
+            forbidden_point = Point(forbidden_xy)
+            # Add all nodes within 2 px to forbidden set
+            for node_id in skeleton_graph.nodes():
+                if node_id in forbidden_with_guard:
+                    continue
+                node_xy = skeleton_graph.nodes[node_id]['xy']
+                node_point = Point(node_xy)
+                if forbidden_point.distance(node_point) <= guard_distance_um:
+                    forbidden_with_guard.add(node_id)
+    
+    # Build clusters using BFS/union-find over endpoints
     merged = {}
     used = set()
     cluster_id = 0
@@ -1391,29 +1435,65 @@ def merge_close_endpoints(
         if node1 in used:
             continue
         
+        # Guard: only merge nodes where degree==1
+        if degrees.get(node1, 0) != 1:
+            continue
+        
+        # Check if node1 is in forbidden zone
+        if node1 in forbidden_with_guard:
+            continue
+        
         cluster = [node1]
         used.add(node1)
         
-        # Find all close endpoints
-        xy1 = skeleton_graph.nodes[node1]['xy']
-        point1 = Point(xy1)
-        
+        # Find all topologically close endpoints using BFS
         for j, node2 in enumerate(endpoint_nodes[i+1:], start=i+1):
             if node2 in used:
                 continue
             
-            xy2 = skeleton_graph.nodes[node2]['xy']
-            point2 = Point(xy2)
-            dist = point1.distance(point2)
+            # Guard: only merge nodes where degree==1
+            if degrees.get(node2, 0) != 1:
+                continue
             
-            if dist <= merge_distance_um:
+            # Check if node2 is in forbidden zone
+            if node2 in forbidden_with_guard:
+                continue
+            
+            # Check graph-shortest-path length
+            try:
+                path_length = nx.shortest_path_length(skeleton_graph, node1, node2)
+            except nx.NetworkXNoPath:
+                continue
+            
+            # Check if path length is within limit
+            if path_length > K:
+                continue
+            
+            # Get the actual path and check all intermediate nodes are degree-2
+            try:
+                path = nx.shortest_path(skeleton_graph, node1, node2)
+            except nx.NetworkXNoPath:
+                continue
+            
+            # Check that all intermediate nodes (excluding endpoints) are degree-2
+            # and not in forbidden set
+            path_valid = True
+            for n in path[1:-1]:  # Exclude endpoints
+                if degrees.get(n, 0) != 2:
+                    path_valid = False
+                    break
+                if n in forbidden_with_guard:
+                    path_valid = False
+                    break
+            
+            if path_valid:
                 cluster.append(node2)
                 used.add(node2)
         
         merged[cluster_id] = cluster
         cluster_id += 1
     
-    logger.debug("merge_close_endpoints: merged %d endpoints into %d clusters",
+    logger.debug("merge_close_endpoints: merged %d endpoints into %d clusters (topology-aware)",
                 len(endpoint_nodes), len(merged))
     
     return merged

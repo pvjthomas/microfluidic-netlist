@@ -823,16 +823,30 @@ def extract_graph_from_polygon(
     junction_clusters = cluster_junction_pixels(skeleton_graph, um_per_px)
     logger.info(f"Clustered {sum(len(v) for v in junction_clusters.values())} junction pixels into {len(junction_clusters)} junction clusters")
     
+    # Build forbidden set from junction pixels (for endpoint merging guard)
+    forbidden_nodes = set()
+    for cluster_nodes in junction_clusters.values():
+        forbidden_nodes.update(cluster_nodes)
+    logger.debug(f"Built forbidden set with {len(forbidden_nodes)} junction pixels")
+    
     # Identify endpoints (before merging)
     endpoint_nodes = [n for n in skeleton_graph.nodes() if skeleton_graph.degree(n) == 1]
     logger.info(f"Found {len(endpoint_nodes)} endpoint pixels")
     
-    # B) Merge close endpoints using factor of minimum channel width
-    endpoint_merge_distance = endpoint_merge_distance_factor * minimum_channel_width
-    logger.debug("extract_graph_from_polygon: endpoint_merge_distance=%.2f µm (factor=%.2f × width=%.2f)",
-                 endpoint_merge_distance, endpoint_merge_distance_factor, minimum_channel_width)
-    endpoint_clusters = merge_close_endpoints(skeleton_graph, endpoint_nodes, endpoint_merge_distance)
-    logger.info(f"Merged {len(endpoint_nodes)} endpoints into {len(endpoint_clusters)} endpoint clusters")
+    # B) Merge close endpoints using topology-aware pixel-based merging
+    # Use pixel-scale: min(2.0 * um_per_px, 0.2 * minimum_channel_width) * factor
+    # This prevents giant merge distances and keeps merging pixel-scale
+    endpoint_merge_distance = min(2.0 * um_per_px, 0.2 * minimum_channel_width) * endpoint_merge_distance_factor
+    logger.debug("extract_graph_from_polygon: endpoint_merge_distance=%.2f µm (pixel-based: min(2.0×%.2f, 0.2×%.2f)×%.2f)",
+                 endpoint_merge_distance, um_per_px, minimum_channel_width, endpoint_merge_distance_factor)
+    endpoint_clusters = merge_close_endpoints(
+        skeleton_graph, 
+        endpoint_nodes, 
+        endpoint_merge_distance,
+        um_per_px=um_per_px,
+        forbidden_nodes=forbidden_nodes
+    )
+    logger.info(f"Merged {len(endpoint_nodes)} endpoints into {len(endpoint_clusters)} endpoint clusters (topology-aware)")
     
     # Build true nodes from clusters
     true_nodes = {}  # Map from internal node_id to (x, y)
@@ -1347,11 +1361,21 @@ def extract_graph_from_polygon(
     
     logger.info(f"Graph built: {len(nodes)} nodes, {len(edges)} edges in {node_build_time + edge_build_time:.2f}s total")
     
-    return {
+    result = {
         'nodes': nodes,
         'edges': edges,
-        'skeleton_graph': skeleton_graph  # For debugging/visualization
+        'skeleton_graph': skeleton_graph,  # For debugging/visualization
+        # C2 data: skeleton graph after endpoint merging
+        'c2_data': {
+            'skeleton_graph': skeleton_graph,  # Skeleton graph after endpoint merging
+            'junction_clusters': junction_clusters,
+            'endpoint_clusters': endpoint_clusters,
+            'forbidden_nodes': forbidden_nodes,
+            'polygon': polygon
+        }
     }
+    
+    return result
 
 
 def extract_graph_from_polygons(

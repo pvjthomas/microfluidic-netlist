@@ -389,6 +389,7 @@ def run_pipeline(
                 'A': enable_step_a,
                 'B': enable_step_b,
                 'C': enable_step_c,
+                'C2': enable_step_c and enable_step_d,  # C2 is enabled if both C and D are enabled
                 'D': enable_step_d
             }
             
