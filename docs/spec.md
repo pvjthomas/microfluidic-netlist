@@ -230,6 +230,54 @@ Output:
 
 selected_region_ids
 
+B.5) Manual Centerline Mode (optional, before automatic skeletonization)
+
+Semi-automated centerline extraction via interactive boundary selection.
+
+Workflow:
+
+User opens interactive matplotlib window showing:
+- Channel polygon fill
+- Boundary segments as selectable pick targets (labeled B0, B1, B2, etc.)
+- Any existing saved centerlines (from previous session)
+
+User interaction:
+1. Click boundary segment #1 (highlights in red)
+2. Click boundary segment #2 (highlights in red)
+3. Press Enter to compute centerline between the two selected boundaries
+
+Centerline computation (V1):
+- Sample along boundary1 every spacing units
+- For each sample point, cast a ray in normal direction toward boundary2
+- Find intersection point with boundary2
+- Take midpoint between sample point and intersection
+- Fit polyline through midpoints and simplify slightly
+- If intersection fails too often (>50% failures), fall back to skeletonizing the polygon clipped to the corridor region between the two boundaries
+
+Features:
+- Undo (Backspace): remove last centerline drawn and remove its record
+- Reset selection (Escape): clear the two selected segments without altering saved lines
+- Toggle behavior: re-entering an existing pair removes it from the list
+- Delete All button: removes all centerlines
+- Done button: closes window and saves
+
+Data persistence:
+- Centerlines saved to JSON file: `#FILENAME_manual_centerlines.json` (associated with DXF filename)
+- Format: `{"centerlines": [{"boundary_ids": ["B0", "B1"], "centerline": {"type": "LineString", "coordinates": [[x,y], ...]}}, ...]}`
+- Boundary segments have stable IDs; if input is polygon exterior, create segments from consecutive coords and assign ids
+- If DXF edges are present, use them as segments (preserves original DXF edge structure)
+
+Display:
+- All coordinates displayed in mm (converted from micrometers)
+- Status overlay: selected ids, record count, last save path
+- Pairs list: shows all line pairs on right side of window
+- Label boxes automatically adjusted to avoid overlaps
+
+Integration:
+- Available as optional mode in pipeline visualizer
+- Can be used before or instead of automatic skeletonization
+- Manual centerlines can be loaded and used in graph extraction
+
 C) Skeleton → graph extraction (polygon-based)
 
 Input: one or more channel polygons.
@@ -254,15 +302,30 @@ Optionally smooth centerlines (simplify tolerance)
 
 Skeletonization Strategy (V1)
 
+Resolution calculation:
+
+The resolution (um_per_px) is determined by two constraints:
+1. Minimum channel width constraint: um_per_px = ceil(minimum_channel_width / 10.0) to ensure sufficient resolution for skeletonization
+2. Size constraint: um_per_px must be large enough so the polygon fits within max_dimension (8000 pixels per side)
+
+Hard maximum constraint: um_per_px <= minimum_channel_width / 10.0 to ensure at least ~10 pixels across the minimum channel width. This is critical for skeleton stability and accuracy.
+
+If the size constraint would require um_per_px to exceed this maximum, raise a clear error suggesting the user:
+- Increase minimum_channel_width
+- Enable tiling to split the polygon into smaller chunks (future feature)
+- Select a smaller subset of polygons to process
+
+The bounding box used for size calculations is computed from selected_polygons only (not the full DXF bounds), to avoid unrelated geometry or huge coordinate offsets affecting the resolution.
+
 Performance optimizations for V1:
 
 Replace point-in-polygon loops with PIL-based raster fill. Use PIL's ImageDraw to fill polygon interiors, which is faster than per-pixel Shapely contains() checks and natively supports holes (interior rings).
 
 Add guardrails on raster size to prevent memory exhaustion:
 
-enforce maximum pixels (e.g., 50M pixels) or maximum image dimension (e.g., 10k pixels per side)
+enforce maximum pixels (e.g., 50M pixels) or maximum image dimension (e.g., 8000 pixels per side)
 
-if polygon would exceed limits, reduce px_per_unit automatically and warn
+if polygon would exceed limits and violate the hard maximum constraint, raise an error with clear guidance
 
 Crop to tight mask bounds before skeletonize. After rasterization, crop the binary image to the tight bounding box of filled pixels to reduce memory and processing time for the skeletonization algorithm.
 

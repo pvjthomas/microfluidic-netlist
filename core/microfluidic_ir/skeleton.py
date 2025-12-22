@@ -10,6 +10,7 @@ from scipy import ndimage
 from typing import List, Tuple, Dict, Any, Optional
 import logging
 import time
+import itertools
 from pathlib import Path
 from PIL import Image, ImageDraw
 import threading
@@ -122,13 +123,13 @@ def rasterize_polygon(
         """Convert Shapely coordinates to PIL image coordinates.
         
         Note: pixel_to_coords uses y = origin_y + (row * um_per_px), so row 0 
-        corresponds to minimum y (bottom in standard view, but our origin_y is min_y).
-        PIL ImageDraw expects coordinates with y increasing downward, but we'll flip
-        the image vertically after drawing to match the transform semantics.
+        corresponds to minimum y. PIL ImageDraw expects coordinates with y increasing 
+        downward. We draw with y increasing upward (no flip here), then flip the final 
+        image with np.flipud to match the transform semantics.
         """
         img_x = int((shapely_x - padded_minx) / um_per_px)
-        # Flip y-axis: PIL y increases down, but our transform has y increase up with row
-        img_y = int(img_height - 1 - (shapely_y - padded_miny) / um_per_px)
+        # No Y-flip here - we'll flip the final image with np.flipud
+        img_y = int((shapely_y - padded_miny) / um_per_px)
         return (img_x, img_y)
     
     # Fill exterior with 1 (white)
@@ -214,7 +215,7 @@ def rasterize_polygon(
 def estimate_channel_width_and_resolution(
     polygon: Polygon,
     coarse_um_per_px: float = 30.0,
-    target_pixels_per_width: float = 5.0,
+    target_pixels_per_width: float = 15.0,
     width_percentile: float = 7.5,
     min_um_per_px: float = 1.0,
     max_um_per_px: float = 100.0
@@ -224,12 +225,12 @@ def estimate_channel_width_and_resolution(
     
     Uses a coarse distance transform to estimate local channel widths,
     then selects um_per_px so the narrowest channel has approximately
-    target_pixels_per_width pixels across it.
+    target_pixels_per_width pixels across it, with a hard minimum of 10 pixels.
     
     Args:
         polygon: Shapely polygon to analyze
         coarse_um_per_px: Resolution for coarse rasterization (default: 30 µm)
-        target_pixels_per_width: Target pixels across narrowest channel (default: 5.0)
+        target_pixels_per_width: Target pixels across narrowest channel (default: 15.0)
         width_percentile: Percentile of widths to use (lower = more conservative, default: 7.5)
         min_um_per_px: Minimum allowed resolution (default: 1.0 µm/pixel)
         max_um_per_px: Maximum allowed resolution (default: 100.0 µm/pixel)
@@ -307,8 +308,19 @@ def estimate_channel_width_and_resolution(
     # Choose um_per_px so narrowest channel has target_pixels_per_width pixels
     recommended_um_per_px = estimated_narrowest_width_um / target_pixels_per_width
     
+    # Enforce hard minimum of 10 pixels across narrowest channel
+    # This ensures skeleton stability even for very narrow channels
+    min_pixels_per_width = 10.0
+    max_um_per_px_for_min_pixels = estimated_narrowest_width_um / min_pixels_per_width
+    recommended_um_per_px = min(recommended_um_per_px, max_um_per_px_for_min_pixels)
+    
     # Clamp to reasonable bounds
     recommended_um_per_px = max(min_um_per_px, min(max_um_per_px, recommended_um_per_px))
+    
+    # Verify final pixel count
+    final_pixels_per_width = estimated_narrowest_width_um / recommended_um_per_px
+    logger.debug("estimate_channel_width_and_resolution: final resolution gives %.1f pixels across narrowest channel",
+                 final_pixels_per_width)
     
     elapsed = time.time() - start
     logger.info("estimate_channel_width_and_resolution: narrowest width=%.2f µm (%.1f%%ile), recommended um_per_px=%.2f (%.1fs)",
@@ -341,42 +353,23 @@ def coords_to_pixel(
 
 def skeletonize_polygon(
     polygon: Polygon,
-    um_per_px: Optional[float] = None,
-    simplify_tolerance: Optional[float] = None,
-    auto_tune_resolution: bool = True,
-    target_pixels_per_width: float = 5.0
+    um_per_px: float,
+    simplify_tolerance: Optional[float] = None
 ) -> Tuple[nx.Graph, Dict[str, Any]]:
     """
     Skeletonize a polygon and convert to a NetworkX graph.
     
     Args:
         polygon: Shapely polygon to skeletonize
-        um_per_px: Resolution for rasterization (microns per pixel). If None and 
-                   auto_tune_resolution=True, will be auto-tuned based on channel width.
+        um_per_px: Resolution for rasterization (microns per pixel) (required)
         simplify_tolerance: Tolerance for simplifying centerlines (in original units).
                            If None, auto-computed as 0.5 * um_per_px.
-        auto_tune_resolution: If True and um_per_px is None, auto-tune resolution based on channel width
-        target_pixels_per_width: Target pixels across narrowest channel for auto-tuning (default: 5.0)
     
     Returns:
         Tuple of (skeleton_graph, metadata) where:
         - skeleton_graph: NetworkX graph with nodes as (x, y) tuples
         - metadata: Transform and processing info
     """
-    # Auto-tune resolution if needed
-    if um_per_px is None and auto_tune_resolution:
-        logger.debug("skeletonize_polygon: auto-tuning resolution")
-        estimated_width, um_per_px = estimate_channel_width_and_resolution(
-            polygon,
-            target_pixels_per_width=target_pixels_per_width
-        )
-        logger.info("skeletonize_polygon: auto-tuned um_per_px=%.2f (narrowest width=%.2f µm)",
-                   um_per_px, estimated_width)
-    elif um_per_px is None:
-        um_per_px = 20.0  # Default fallback
-        logger.warning("skeletonize_polygon: um_per_px not specified and auto_tune_resolution=False, using default %.2f",
-                      um_per_px)
-    
     # Auto-compute simplify_tolerance from um_per_px if not specified
     # simplify_tolerance should be <= 0.5 * um_per_px to avoid over-simplification
     if simplify_tolerance is None:
@@ -506,19 +499,25 @@ def skeletonize_polygon(
     
     # 1. Pre-clean the binary mask before medial axis
     logger.debug("Pre-cleaning binary mask: morphological operations")
-    # Morphological closing (disk radius ~2 px) to remove endcap notches
-    closing_radius = 2
+    # Morphological closing: scale radius with um_per_px to maintain physical size
+    # Target: ~2 µm physical radius for closing
+    closing_radius_um = 2.0  # micrometers
+    closing_radius_px = max(1, int(closing_radius_um / um_per_px))
     try:
-        img_binary = binary_closing(img_binary, disk(closing_radius))
-        logger.debug("Applied binary closing with radius %d", closing_radius)
+        img_binary = binary_closing(img_binary, disk(closing_radius_px))
+        logger.debug("Applied binary closing with radius %d px (%.2f µm physical)", 
+                    closing_radius_px, closing_radius_px * um_per_px)
     except Exception as e:
         logger.warning("Binary closing failed: %s", e)
     
-    # Optional opening (radius 1 px) to remove pepper noise
-    opening_radius = 1
+    # Optional opening: scale radius with um_per_px to maintain physical size
+    # Target: ~1 µm physical radius for opening
+    opening_radius_um = 1.0  # micrometers
+    opening_radius_px = max(1, int(opening_radius_um / um_per_px))
     try:
-        img_binary = binary_opening(img_binary, disk(opening_radius))
-        logger.debug("Applied binary opening with radius %d", opening_radius)
+        img_binary = binary_opening(img_binary, disk(opening_radius_px))
+        logger.debug("Applied binary opening with radius %d px (%.2f µm physical)", 
+                    opening_radius_px, opening_radius_px * um_per_px)
     except Exception as e:
         logger.warning("Binary opening failed: %s", e)
     
@@ -679,14 +678,21 @@ def skeletonize_polygon(
     logger.info(f"Skeleton: {len(skeleton_pixels)} skeleton pixels in {skeleton_time + find_time:.2f}s total")
     
     # Convert skeleton pixels to coordinate space
+    # After np.flipud, the image array is flipped vertically, so row indices are inverted.
+    # pixel_to_coords assumes row 0 = minimum y (origin_y). After flipud, what was row (height-1)
+    # (top/max y) is now row 0, so we need to invert: use (img_height - 1 - row)
     logger.debug("skeletonize_polygon: converting %d skeleton pixels to coordinates",
                  len(skeleton_pixels))
     skeleton_coords = []
+    img_height = skeleton_img.shape[0]
     try:
         for i, pixel in enumerate(skeleton_pixels):
             if i % 10000 == 0 and i > 0:
                 logger.debug("skeletonize_polygon: converted %d/%d pixels", i, len(skeleton_pixels))
-            coords = pixel_to_coords((pixel[0], pixel[1]), transform)
+            row, col = pixel[0], pixel[1]
+            # Invert row to account for np.flipud
+            inverted_row = img_height - 1 - row
+            coords = pixel_to_coords((inverted_row, col), transform)
             skeleton_coords.append(coords)
         logger.debug("skeletonize_polygon: coordinate conversion complete")
     except Exception as e:
@@ -707,7 +713,10 @@ def skeletonize_polygon(
         for i, pixel in enumerate(skeleton_pixels):
             if i % 10000 == 0 and i > 0:
                 logger.debug("skeletonize_polygon: added %d/%d nodes", i, len(skeleton_pixels))
-            coords = pixel_to_coords((pixel[0], pixel[1]), transform)
+            row, col = pixel[0], pixel[1]
+            # Invert row to account for np.flipud
+            inverted_row = img_height - 1 - row
+            coords = pixel_to_coords((inverted_row, col), transform)
             node_id = i
             G.add_node(node_id, xy=coords)
             pixel_to_node[tuple(pixel)] = node_id
@@ -774,6 +783,7 @@ def skeletonize_polygon(
     
     logger.debug("skeletonize_polygon: complete, total time: %.2fs", total_time)
     
+    # Return raw pixel graph (conversion to vector graph should be done by caller if needed)
     return G, transform
 
 
@@ -782,10 +792,14 @@ def extract_skeleton_paths(
     simplify_tolerance: Optional[float] = None
 ) -> List[List[Tuple[float, float]]]:
     """
-    Extract centerline paths from skeleton graph.
+    Extract centerline paths from skeleton graph using edge-walk decomposition.
     
-    Identifies endpoints (degree 1) and junctions (degree >= 3),
-    then extracts paths between them.
+    Enumerates every edge exactly once by:
+    1. Identifying "key nodes" where degree != 2 (endpoints + junctions)
+    2. For each key node, for each neighbor, walk forward along degree-2 nodes
+       until reaching another key node, recording that polyline and marking edges visited
+    3. Handle any remaining unvisited edges (pure cycles where all nodes have degree==2)
+       by picking any unvisited edge and walking the cycle until returning to start
     
     Args:
         skeleton_graph: NetworkX graph from skeletonization
@@ -802,111 +816,125 @@ def extract_skeleton_paths(
         logger.debug("extract_skeleton_paths: empty graph, returning empty list")
         return []
     
-    # Identify nodes by degree
-    logger.debug("extract_skeleton_paths: identifying endpoints and junctions")
-    try:
-        endpoints = [n for n in skeleton_graph.nodes() if skeleton_graph.degree(n) == 1]
-        junctions = [n for n in skeleton_graph.nodes() if skeleton_graph.degree(n) >= 3]
-        logger.debug("extract_skeleton_paths: found %d endpoints, %d junctions", 
-                     len(endpoints), len(junctions))
-    except Exception as e:
-        logger.error("extract_skeleton_paths: failed to identify nodes: %s", e, exc_info=True)
-        raise
-    
-    # If no endpoints/junctions, return single path through all nodes
-    if not endpoints and not junctions:
-        # Simple path through all connected nodes
-        if len(skeleton_graph) > 0:
-            nodes = list(skeleton_graph.nodes())
-            path = [skeleton_graph.nodes[n]['xy'] for n in nodes]
-            return [path] if len(path) > 1 else []
-        return []
-    
-    # Extract paths between endpoints and junctions
-    logger.debug("extract_skeleton_paths: extracting paths between endpoints and junctions")
     paths = []
     visited_edges = set()
     
-    # Start from each endpoint
-    try:
-        for idx, start in enumerate(endpoints):
-            if idx % 10 == 0 and idx > 0:
-                logger.debug("extract_skeleton_paths: processed %d/%d endpoints", idx, len(endpoints))
-            if start not in skeleton_graph:
-                logger.warning("extract_skeleton_paths: endpoint %d not in graph", start)
+    # Helper to make edge tuple (sorted for consistency)
+    def edge_tuple(u, v):
+        return tuple(sorted([u, v]))
+    
+    # Helper to walk along degree-2 nodes from a starting node
+    def walk_path(start_node, first_neighbor, visited_set):
+        """Walk from start_node through first_neighbor along degree-2 nodes until reaching a key node."""
+        path_nodes = [start_node, first_neighbor]
+        current = first_neighbor
+        prev = start_node
+        
+        # Walk forward along degree-2 nodes
+        while skeleton_graph.degree(current) == 2:
+            # Find the next node (the neighbor that's not prev)
+            neighbors = list(skeleton_graph.neighbors(current))
+            if len(neighbors) != 2:
+                break  # Safety check
+            next_node = neighbors[1] if neighbors[0] == prev else neighbors[0]
+            path_nodes.append(next_node)
+            prev = current
+            current = next_node
+            
+            # Check if we've already visited this edge (cycle detected)
+            edge = edge_tuple(prev, current)
+            if edge in visited_set:
+                break
+        
+        return path_nodes, current
+    
+    # Step 1: Identify key nodes (degree != 2)
+    key_nodes = [n for n in skeleton_graph.nodes() if skeleton_graph.degree(n) != 2]
+    logger.debug("extract_skeleton_paths: found %d key nodes (degree != 2)", len(key_nodes))
+    
+    # Step 2: For each key node, for each neighbor, walk forward until reaching another key node
+    for key_node in key_nodes:
+        for neighbor in skeleton_graph.neighbors(key_node):
+            edge = edge_tuple(key_node, neighbor)
+            
+            # Skip if we've already visited this edge
+            if edge in visited_edges:
                 continue
             
-            # Find path to nearest junction or endpoint
-            targets = junctions + [ep for ep in endpoints if ep != start]
-            logger.debug("extract_skeleton_paths: endpoint %d has %d targets", start, len(targets))
+            # Walk forward from this neighbor
+            path_nodes, end_node = walk_path(key_node, neighbor, visited_edges)
             
-            path_found = False
-            for target in targets:
-                if target == start:
-                    continue
-                
-                try:
-                    path_nodes = nx.shortest_path(skeleton_graph, start, target)
-                    path_coords = [skeleton_graph.nodes[n]['xy'] for n in path_nodes]
-                    
-                    # Check if we've used these edges
-                    path_edges = set()
-                    for i in range(len(path_nodes) - 1):
-                        edge = tuple(sorted([path_nodes[i], path_nodes[i+1]]))
-                        path_edges.add(edge)
-                    
-                    if not path_edges.intersection(visited_edges):
-                        paths.append(path_coords)
-                        visited_edges.update(path_edges)
-                        logger.debug("extract_skeleton_paths: added path from endpoint %d to %d (%d nodes)",
-                                    start, target, len(path_nodes))
-                        path_found = True
-                        break  # Found a path from this endpoint
-                except nx.NetworkXNoPath:
-                    continue
-                except Exception as e:
-                    logger.warning("extract_skeleton_paths: error finding path from %d to %d: %s",
-                                  start, target, e)
-                    continue
+            # Mark all edges in this path as visited
+            for i in range(len(path_nodes) - 1):
+                visited_edges.add(edge_tuple(path_nodes[i], path_nodes[i+1]))
             
-            if not path_found:
-                logger.debug("extract_skeleton_paths: no path found from endpoint %d", start)
-    except Exception as e:
-        logger.error("extract_skeleton_paths: failed to extract paths from endpoints: %s", 
-                     e, exc_info=True)
-        raise
+            # Convert to coordinates
+            path_coords = [skeleton_graph.nodes[n]['xy'] for n in path_nodes]
+            paths.append(path_coords)
+            logger.debug("extract_skeleton_paths: added path from key node %d to %d (%d nodes)",
+                        key_node, end_node, len(path_nodes))
     
-    # Also handle paths between junctions
-    logger.debug("extract_skeleton_paths: extracting paths between %d junctions", len(junctions))
-    try:
-        for i, j1 in enumerate(junctions):
-            if i % 10 == 0 and i > 0:
-                logger.debug("extract_skeleton_paths: processed %d/%d junctions", i, len(junctions))
-            for j2 in junctions[i+1:]:
-                try:
-                    path_nodes = nx.shortest_path(skeleton_graph, j1, j2)
-                    path_coords = [skeleton_graph.nodes[n]['xy'] for n in path_nodes]
-                    
-                    path_edges = set()
-                    for k in range(len(path_nodes) - 1):
-                        edge = tuple(sorted([path_nodes[k], path_nodes[k+1]]))
-                        path_edges.add(edge)
-                    
-                    if not path_edges.intersection(visited_edges):
-                        paths.append(path_coords)
-                        visited_edges.update(path_edges)
-                        logger.debug("extract_skeleton_paths: added path between junctions %d and %d (%d nodes)",
-                                    j1, j2, len(path_nodes))
-                except nx.NetworkXNoPath:
-                    continue
-                except Exception as e:
-                    logger.warning("extract_skeleton_paths: error finding path between junctions %d and %d: %s",
-                                  j1, j2, e)
-                    continue
-    except Exception as e:
-        logger.error("extract_skeleton_paths: failed to extract paths between junctions: %s", 
-                     e, exc_info=True)
-        raise
+    # Step 3: Handle remaining unvisited edges (pure cycles where all nodes have degree==2)
+    all_edges = set(edge_tuple(u, v) for u, v in skeleton_graph.edges())
+    remaining_edges = all_edges - visited_edges
+    
+    if remaining_edges:
+        logger.debug("extract_skeleton_paths: found %d remaining unvisited edges (pure cycles)", 
+                     len(remaining_edges))
+        
+        while remaining_edges:
+            # Pick any unvisited edge
+            edge = remaining_edges.pop()
+            u, v = edge
+            
+            # Mark this edge as visited
+            visited_edges.add(edge)
+            
+            # Start walking the cycle from u -> v
+            path_nodes = [u, v]
+            current = v
+            prev = u
+            cycle_complete = False
+            
+            # Walk until we return to the start node
+            max_steps = len(skeleton_graph)  # Safety limit
+            steps = 0
+            while not cycle_complete and steps < max_steps:
+                steps += 1
+                
+                # Find next node (neighbor that's not prev)
+                neighbors = list(skeleton_graph.neighbors(current))
+                if len(neighbors) != 2:
+                    # Shouldn't happen in a pure cycle, but handle gracefully
+                    logger.warning("extract_skeleton_paths: cycle node %d has degree %d (expected 2)", 
+                                 current, len(neighbors))
+                    break
+                
+                next_node = neighbors[1] if neighbors[0] == prev else neighbors[0]
+                edge_to_next = edge_tuple(current, next_node)
+                
+                # Mark this edge as visited
+                visited_edges.add(edge_to_next)
+                remaining_edges.discard(edge_to_next)
+                
+                # Check if we've completed the cycle (returned to start)
+                if next_node == u:
+                    cycle_complete = True
+                    # Close the cycle by adding start node at end
+                    path_nodes.append(u)
+                    break
+                
+                path_nodes.append(next_node)
+                prev = current
+                current = next_node
+            
+            if cycle_complete:
+                # Convert to coordinates (including closing the cycle)
+                path_coords = [skeleton_graph.nodes[n]['xy'] for n in path_nodes]
+                paths.append(path_coords)
+                logger.debug("extract_skeleton_paths: added cycle path with %d nodes", len(path_nodes))
+            else:
+                logger.warning("extract_skeleton_paths: failed to complete cycle starting from edge (%d, %d)", u, v)
     
     logger.debug("extract_skeleton_paths: extracted %d paths before simplification", len(paths))
     
@@ -946,8 +974,327 @@ def extract_skeleton_paths(
     else:
         logger.debug("extract_skeleton_paths: skipping simplification (tolerance not specified or zero)")
         result = paths
-    logger.debug("extract_skeleton_paths: exit, returning %d paths", len(result))
+    
+    logger.debug("extract_skeleton_paths: exit, returning %d paths, visited %d/%d edges", 
+                 len(result), len(visited_edges), len(all_edges))
     return result
+
+
+def build_vector_centerline_graph(
+    skeleton_graph: nx.Graph,
+    um_per_px: float,
+    simplify_tolerance: Optional[float] = None,
+    resample_spacing_um: Optional[float] = None,
+    merge_distance_um: Optional[float] = None,
+    polygon: Optional[Polygon] = None
+) -> Tuple[nx.Graph, Dict[str, Any]]:
+    """
+    Convert pixel-skeleton graph to vector centerline graph.
+    
+    Process:
+    1. Extract skeleton paths (polylines) from pixel graph
+    2. Simplify each polyline using Douglas-Peucker
+    3. Resample at fixed spacing to get evenly spaced nodes
+    4. Rebuild NetworkX graph with resampled points
+    5. Optionally merge nearby endpoints/junctions
+    
+    Args:
+        skeleton_graph: Pixel-skeleton NetworkX graph (one node per skeleton pixel)
+        um_per_px: Resolution (microns per pixel)
+        simplify_tolerance: Tolerance for path simplification. If None, uses 0.5 * um_per_px
+        resample_spacing_um: Spacing for resampling nodes. If None, uses 1.0 * um_per_px
+        merge_distance_um: Distance for merging nearby endpoints/junctions. If None, uses 2.0 * um_per_px
+        polygon: Optional polygon for validation (if provided, nodes are constrained to stay inside)
+    
+    Returns:
+        Tuple of (vector_graph, metadata_dict) where:
+        - vector_graph: NetworkX graph with resampled nodes and edges
+        - metadata_dict: Contains original_paths, simplified_paths, etc.
+    """
+    from shapely.geometry import LineString, Point
+    
+    logger.info("build_vector_centerline_graph: converting pixel graph to vector centerline graph")
+    
+    if len(skeleton_graph) == 0:
+        logger.warning("build_vector_centerline_graph: empty skeleton graph")
+        return nx.Graph(), {'original_paths': [], 'simplified_paths': []}
+    
+    # Set default parameters
+    if simplify_tolerance is None:
+        simplify_tolerance = 0.5 * um_per_px
+    if resample_spacing_um is None:
+        resample_spacing_um = 1.0 * um_per_px
+    if merge_distance_um is None:
+        merge_distance_um = 2.0 * um_per_px
+    
+    logger.debug("build_vector_centerline_graph: parameters: simplify_tolerance=%.3f, "
+                 "resample_spacing=%.3f, merge_distance=%.3f",
+                 simplify_tolerance, resample_spacing_um, merge_distance_um)
+    
+    # Step 1: Extract skeleton paths
+    logger.debug("build_vector_centerline_graph: extracting skeleton paths")
+    original_paths = extract_skeleton_paths(skeleton_graph, simplify_tolerance=None)
+    logger.info("build_vector_centerline_graph: extracted %d original paths", len(original_paths))
+    
+    if not original_paths:
+        logger.warning("build_vector_centerline_graph: no paths extracted")
+        return nx.Graph(), {'original_paths': [], 'simplified_paths': []}
+    
+    # Step 2: Simplify each path
+    logger.debug("build_vector_centerline_graph: simplifying %d paths", len(original_paths))
+    simplified_paths = []
+    for idx, path in enumerate(original_paths):
+        if len(path) < 2:
+            continue
+        try:
+            line = LineString(path)
+            simplified = line.simplify(simplify_tolerance, preserve_topology=False)
+            if simplified.geom_type == 'LineString':
+                simplified_paths.append(list(simplified.coords))
+            elif simplified.geom_type == 'MultiLineString':
+                # Take longest segment
+                longest = max(simplified.geoms, key=lambda g: g.length)
+                simplified_paths.append(list(longest.coords))
+            else:
+                logger.warning("build_vector_centerline_graph: path %d simplified to unexpected type: %s",
+                              idx, simplified.geom_type)
+                simplified_paths.append(path)  # Fallback to original
+        except Exception as e:
+            logger.warning("build_vector_centerline_graph: failed to simplify path %d: %s", idx, e)
+            simplified_paths.append(path)  # Fallback to original
+    
+    logger.info("build_vector_centerline_graph: simplified to %d paths", len(simplified_paths))
+    
+    # Step 3: Resample each path at fixed spacing
+    logger.debug("build_vector_centerline_graph: resampling paths at spacing=%.3f", resample_spacing_um)
+    resampled_paths = []
+    for path_idx, path_coords in enumerate(simplified_paths):
+        if len(path_coords) < 2:
+            continue
+        
+        line = LineString(path_coords)
+        length = line.length
+        
+        if length < resample_spacing_um:
+            # Path too short, keep original points
+            resampled_paths.append(path_coords)
+            continue
+        
+        # Resample at fixed spacing
+        num_samples = max(2, int(np.ceil(length / resample_spacing_um)) + 1)
+        distances = np.linspace(0, length, num_samples)
+        
+        resampled_coords = []
+        for dist in distances:
+            point = line.interpolate(dist)
+            x, y = point.x, point.y
+            
+            # Optional: Project back onto polygon boundary if provided
+            if polygon is not None:
+                point_obj = Point(x, y)
+                if not polygon.contains(point_obj):
+                    # Find nearest point on polygon boundary
+                    nearest = polygon.exterior.interpolate(polygon.exterior.project(point_obj))
+                    x, y = nearest.x, nearest.y
+            
+            resampled_coords.append((x, y))
+        
+        resampled_paths.append(resampled_coords)
+    
+    logger.info("build_vector_centerline_graph: resampled to %d paths", len(resampled_paths))
+    
+    # Step 4: Build new NetworkX graph
+    logger.debug("build_vector_centerline_graph: building vector graph")
+    vector_graph = nx.Graph()
+    node_counter = itertools.count()
+    node_id_map = {}  # Map (x, y) -> node_id
+    
+    for path_idx, path_coords in enumerate(resampled_paths):
+        if len(path_coords) < 2:
+            continue
+        
+        # Add nodes and edges for this path
+        prev_node_id = None
+        prev_coord = None
+        segment_start_idx = 0
+        
+        for coord_idx, coord in enumerate(path_coords):
+            x, y = coord
+            
+            # Check if node already exists (for path intersections)
+            node_id = node_id_map.get(coord)
+            if node_id is None:
+                node_id = next(node_counter)
+                vector_graph.add_node(node_id, xy=(x, y))
+                node_id_map[coord] = node_id
+            
+            # Add edge to previous node in path
+            if prev_node_id is not None:
+                # Store polyline geometry on edge - segment from prev_coord to coord
+                if not vector_graph.has_edge(prev_node_id, node_id):
+                    # Extract segment coordinates between prev and current
+                    segment_coords = [prev_coord, coord]
+                    
+                    vector_graph.add_edge(prev_node_id, node_id, 
+                                        polyline=segment_coords,
+                                        path_index=path_idx)
+            
+            prev_node_id = node_id
+            prev_coord = coord
+    
+    logger.info("build_vector_centerline_graph: built vector graph with %d nodes, %d edges",
+                len(vector_graph), len(vector_graph.edges()))
+    
+    # Step 5: Merge nearby endpoints/junctions
+    if merge_distance_um > 0:
+        logger.debug("build_vector_centerline_graph: merging nearby nodes (distance=%.3f)", 
+                     merge_distance_um)
+        
+        # Identify endpoints and junctions
+        degrees = dict(vector_graph.degree())
+        endpoints = [n for n in vector_graph.nodes() if degrees.get(n, 0) == 1]
+        junctions = [n for n in vector_graph.nodes() if degrees.get(n, 0) >= 3]
+        
+        # Merge close endpoints
+        if len(endpoints) > 1:
+            merged_endpoints = {}
+            used = set()
+            cluster_id = 0
+            
+            for i, node1 in enumerate(endpoints):
+                if node1 in used:
+                    continue
+                
+                cluster = [node1]
+                used.add(node1)
+                xy1 = vector_graph.nodes[node1]['xy']
+                point1 = Point(xy1)
+                
+                for node2 in endpoints[i+1:]:
+                    if node2 in used:
+                        continue
+                    
+                    xy2 = vector_graph.nodes[node2]['xy']
+                    point2 = Point(xy2)
+                    dist = point1.distance(point2)
+                    
+                    if dist <= merge_distance_um:
+                        cluster.append(node2)
+                        used.add(node2)
+                
+                if len(cluster) > 1:
+                    merged_endpoints[cluster_id] = cluster
+                    cluster_id += 1
+            
+            # Merge clusters: replace all nodes in cluster with centroid
+            for cluster_nodes in merged_endpoints.values():
+                if len(cluster_nodes) < 2:
+                    continue
+                
+                # Compute centroid
+                coords = [vector_graph.nodes[n]['xy'] for n in cluster_nodes]
+                centroid_x = sum(c[0] for c in coords) / len(coords)
+                centroid_y = sum(c[1] for c in coords) / len(coords)
+                centroid = (centroid_x, centroid_y)
+                
+                # Keep first node, replace others
+                keep_node = cluster_nodes[0]
+                vector_graph.nodes[keep_node]['xy'] = centroid
+                
+                # Merge edges from other nodes to keep_node
+                for node in cluster_nodes[1:]:
+                    # Transfer edges
+                    neighbors = list(vector_graph.neighbors(node))
+                    for neighbor in neighbors:
+                        if neighbor not in cluster_nodes:
+                            if not vector_graph.has_edge(keep_node, neighbor):
+                                edge_data = vector_graph.edges[node, neighbor]
+                                vector_graph.add_edge(keep_node, neighbor, **edge_data)
+                    vector_graph.remove_node(node)
+                    # Remove from node_id_map
+                    for coord, nid in list(node_id_map.items()):
+                        if nid == node:
+                            del node_id_map[coord]
+            
+            logger.info("build_vector_centerline_graph: merged %d endpoint clusters", 
+                       len(merged_endpoints))
+        
+        # Merge close junctions
+        if len(junctions) > 1:
+            merged_junctions = {}
+            used = set()
+            cluster_id = 0
+            
+            for i, node1 in enumerate(junctions):
+                if node1 in used:
+                    continue
+                
+                cluster = [node1]
+                used.add(node1)
+                xy1 = vector_graph.nodes[node1]['xy']
+                point1 = Point(xy1)
+                
+                for node2 in junctions[i+1:]:
+                    if node2 in used:
+                        continue
+                    
+                    xy2 = vector_graph.nodes[node2]['xy']
+                    point2 = Point(xy2)
+                    dist = point1.distance(point2)
+                    
+                    if dist <= merge_distance_um:
+                        cluster.append(node2)
+                        used.add(node2)
+                
+                if len(cluster) > 1:
+                    merged_junctions[cluster_id] = cluster
+                    cluster_id += 1
+            
+            # Merge clusters
+            for cluster_nodes in merged_junctions.values():
+                if len(cluster_nodes) < 2:
+                    continue
+                
+                # Compute centroid
+                coords = [vector_graph.nodes[n]['xy'] for n in cluster_nodes]
+                centroid_x = sum(c[0] for c in coords) / len(coords)
+                centroid_y = sum(c[1] for c in coords) / len(coords)
+                centroid = (centroid_x, centroid_y)
+                
+                # Keep first node, replace others
+                keep_node = cluster_nodes[0]
+                vector_graph.nodes[keep_node]['xy'] = centroid
+                
+                # Merge edges
+                for node in cluster_nodes[1:]:
+                    neighbors = list(vector_graph.neighbors(node))
+                    for neighbor in neighbors:
+                        if neighbor not in cluster_nodes:
+                            if not vector_graph.has_edge(keep_node, neighbor):
+                                edge_data = vector_graph.edges[node, neighbor]
+                                vector_graph.add_edge(keep_node, neighbor, **edge_data)
+                    vector_graph.remove_node(node)
+                    # Remove from node_id_map
+                    for coord, nid in list(node_id_map.items()):
+                        if nid == node:
+                            del node_id_map[coord]
+            
+            logger.info("build_vector_centerline_graph: merged %d junction clusters",
+                       len(merged_junctions))
+    
+    metadata = {
+        'original_paths': original_paths,
+        'simplified_paths': simplified_paths,
+        'resampled_paths': resampled_paths,
+        'simplify_tolerance': simplify_tolerance,
+        'resample_spacing_um': resample_spacing_um,
+        'merge_distance_um': merge_distance_um
+    }
+    
+    logger.info("build_vector_centerline_graph: final graph has %d nodes, %d edges",
+                len(vector_graph), len(vector_graph.edges()))
+    
+    return vector_graph, metadata
 
 
 def cluster_junction_pixels(

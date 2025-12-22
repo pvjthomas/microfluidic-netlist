@@ -11,10 +11,10 @@ router = APIRouter()
 
 class ExtractGraphRequest(BaseModel):
     session_id: str
+    minimum_channel_width: float
     tolerances: dict | None = None
     width_sample_step: float = 10.0
-    px_per_unit: float = 10.0
-    simplify_tolerance: float = 1.0
+    simplify_tolerance: float | None = None
 
 
 class ExtractGraphResponse(BaseModel):
@@ -72,8 +72,9 @@ async def extract_graph(req: ExtractGraphRequest):
     try:
         graph_result = extract_graph_from_polygons(
             polygons,
-            px_per_unit=req.px_per_unit,
-            simplify_tolerance=req.simplify_tolerance
+            minimum_channel_width=req.minimum_channel_width,
+            simplify_tolerance=req.simplify_tolerance,
+            width_sample_step=req.width_sample_step
         )
     except Exception as e:
         raise HTTPException(

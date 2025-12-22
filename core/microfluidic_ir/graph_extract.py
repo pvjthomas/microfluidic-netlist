@@ -757,15 +757,14 @@ def re_center_junctions(
 
 def extract_graph_from_polygon(
     polygon: Any,  # Shapely Polygon
-    um_per_px: Optional[float] = None,
+    minimum_channel_width: float,
+    um_per_px: float,
     simplify_tolerance: Optional[float] = None,
-    auto_tune_resolution: bool = True,
     width_sample_step: float = 10.0,
     measure_edges: bool = True,
     default_height: float = 50.0,
     default_cross_section_kind: str = "rectangular",
     per_edge_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
-    min_channel_width: Optional[float] = None,
     simplify_tolerance_factor: float = 0.5,
     endpoint_merge_distance_factor: float = 1.0
 ) -> Dict[str, Any]:
@@ -774,31 +773,30 @@ def extract_graph_from_polygon(
     
     Args:
         polygon: Shapely polygon
-        um_per_px: Resolution for skeletonization (microns per pixel). If None, will be auto-tuned.
-        simplify_tolerance: Tolerance for path simplification. If None, computed as simplify_tolerance_factor * min_channel_width.
-        auto_tune_resolution: If True and um_per_px is None, auto-tune resolution based on channel width
+        minimum_channel_width: Minimum channel width in micrometers (required)
+        um_per_px: Resolution for skeletonization (microns per pixel) (required)
+        simplify_tolerance: Tolerance for path simplification. If None, computed as simplify_tolerance_factor * minimum_channel_width.
         width_sample_step: Distance between width samples along centerline (default: 10.0)
         measure_edges: If True, measure length and width profile for each edge (default: True)
         default_height: Default height in micrometers (default: 50.0)
         default_cross_section_kind: Default cross-section type (default: "rectangular")
         per_edge_overrides: Optional dict mapping edge_id to override dict
-        min_channel_width: Minimum channel width in micrometers. If None, will be estimated from polygon.
-        simplify_tolerance_factor: Factor to multiply min_channel_width for simplify_tolerance (default: 0.5)
-        endpoint_merge_distance_factor: Factor to multiply min_channel_width for endpoint merge distance (default: 1.0)
+        simplify_tolerance_factor: Factor to multiply minimum_channel_width for simplify_tolerance (default: 0.5)
+        endpoint_merge_distance_factor: Factor to multiply minimum_channel_width for endpoint merge distance (default: 1.0)
     
     Returns:
         Dictionary with:
         - nodes: List of node dicts (id, xy, kind, degree)
         - edges: List of edge dicts (id, u, v, centerline, length, width_profile, cross_section)
         - skeleton_graph: NetworkX graph (for debugging)
+        - transform: Transform dictionary with um_per_px
     """
     # Skeletonize polygon
     logger.info("Building graph from skeleton")
     skeleton_graph, transform = skeletonize_polygon(
         polygon,
         um_per_px=um_per_px,
-        simplify_tolerance=simplify_tolerance,
-        auto_tune_resolution=auto_tune_resolution
+        simplify_tolerance=simplify_tolerance
     )
     
     if len(skeleton_graph) == 0:
@@ -806,29 +804,17 @@ def extract_graph_from_polygon(
         return {
             'nodes': [],
             'edges': [],
-            'skeleton_graph': skeleton_graph
+            'skeleton_graph': skeleton_graph,
+            'transform': transform
         }
-    
-    um_per_px = transform.get('um_per_px', 20.0)
-    
-    # Estimate or use provided minimum channel width
-    if min_channel_width is None:
-        # Estimate from polygon using distance transform
-        from .skeleton import estimate_channel_width_and_resolution
-        estimated_width, _ = estimate_channel_width_and_resolution(
-            polygon,
-            coarse_um_per_px=min(um_per_px * 2, 30.0)  # Use coarser resolution for speed
-        )
-        min_channel_width = estimated_width
-        logger.debug("extract_graph_from_polygon: estimated min_channel_width=%.2f µm", min_channel_width)
-    else:
-        logger.debug("extract_graph_from_polygon: using provided min_channel_width=%.2f µm", min_channel_width)
     
     # Compute simplify_tolerance if not provided
     if simplify_tolerance is None:
-        simplify_tolerance = simplify_tolerance_factor * min_channel_width
+        simplify_tolerance = simplify_tolerance_factor * minimum_channel_width
         logger.debug("extract_graph_from_polygon: computed simplify_tolerance=%.3f (factor=%.2f × width=%.2f)",
-                     simplify_tolerance, simplify_tolerance_factor, min_channel_width)
+                     simplify_tolerance, simplify_tolerance_factor, minimum_channel_width)
+    
+    logger.debug("extract_graph_from_polygon: using minimum_channel_width=%.2f µm", minimum_channel_width)
     
     # A) Cluster junction pixels into connected components
     import time
@@ -842,9 +828,9 @@ def extract_graph_from_polygon(
     logger.info(f"Found {len(endpoint_nodes)} endpoint pixels")
     
     # B) Merge close endpoints using factor of minimum channel width
-    endpoint_merge_distance = endpoint_merge_distance_factor * min_channel_width
+    endpoint_merge_distance = endpoint_merge_distance_factor * minimum_channel_width
     logger.debug("extract_graph_from_polygon: endpoint_merge_distance=%.2f µm (factor=%.2f × width=%.2f)",
-                 endpoint_merge_distance, endpoint_merge_distance_factor, min_channel_width)
+                 endpoint_merge_distance, endpoint_merge_distance_factor, minimum_channel_width)
     endpoint_clusters = merge_close_endpoints(skeleton_graph, endpoint_nodes, endpoint_merge_distance)
     logger.info(f"Merged {len(endpoint_nodes)} endpoints into {len(endpoint_clusters)} endpoint clusters")
     
@@ -1370,9 +1356,9 @@ def extract_graph_from_polygon(
 
 def extract_graph_from_polygons(
     polygons: List[Dict[str, Any]],
+    minimum_channel_width: float,
     um_per_px: Optional[float] = None,
     simplify_tolerance: Optional[float] = None,
-    auto_tune_resolution: bool = True,
     width_sample_step: float = 10.0,
     measure_edges: bool = True,
     circles: Optional[List[Dict[str, Any]]] = None,
@@ -1382,7 +1368,6 @@ def extract_graph_from_polygons(
     default_height: float = 50.0,
     default_cross_section_kind: str = "rectangular",
     per_edge_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
-    min_channel_width: Optional[float] = None,
     simplify_tolerance_factor: float = 0.5,
     endpoint_merge_distance_factor: float = 1.0
 ) -> Dict[str, Any]:
@@ -1391,9 +1376,10 @@ def extract_graph_from_polygons(
     
     Args:
         polygons: List of polygon dicts with 'polygon' key containing GeoJSON
-        um_per_px: Resolution for skeletonization (microns per pixel). If None, will be auto-tuned.
-        simplify_tolerance: Tolerance for path simplification. If None, computed as simplify_tolerance_factor * min_channel_width.
-        auto_tune_resolution: If True and um_per_px is None, auto-tune resolution based on channel width
+        minimum_channel_width: Minimum channel width in micrometers (required).
+                              Used to calculate um_per_px = ceil(minimum_channel_width / 10) if um_per_px not provided.
+        um_per_px: Resolution for skeletonization (microns per pixel). If None, calculated as ceil(minimum_channel_width / 10).
+        simplify_tolerance: Tolerance for path simplification. If None, computed as simplify_tolerance_factor * minimum_channel_width.
         width_sample_step: Distance between width samples along centerline (default: 10.0)
         measure_edges: If True, measure length and width profile for each edge (default: True)
         circles: Optional list of circle dicts from DXF loader for port detection
@@ -1403,28 +1389,42 @@ def extract_graph_from_polygons(
         default_height: Default height in micrometers (default: 50.0)
         default_cross_section_kind: Default cross-section type: "rectangular" or "trapezoid" (default: "rectangular")
         per_edge_overrides: Optional dict mapping edge_id to override dict with height/cross_section_kind
-        min_channel_width: Minimum channel width in micrometers. If None, will be estimated from polygon.
-        simplify_tolerance_factor: Factor to multiply min_channel_width for simplify_tolerance (default: 0.5)
-        endpoint_merge_distance_factor: Factor to multiply min_channel_width for endpoint merge distance (default: 1.0)
+        simplify_tolerance_factor: Factor to multiply minimum_channel_width for simplify_tolerance (default: 0.5)
+        endpoint_merge_distance_factor: Factor to multiply minimum_channel_width for endpoint merge distance (default: 1.0)
     
     Returns:
         Dictionary with nodes, edges, and optionally ports
     """
+    import math
+    
+    # Calculate um_per_px from minimum_channel_width if not provided
+    if um_per_px is None:
+        um_per_px = math.ceil(minimum_channel_width / 10.0)
+        logger.info(f"Calculated um_per_px={um_per_px:.2f} from minimum_channel_width={minimum_channel_width:.2f} µm")
     from shapely.geometry import Polygon
     from shapely.ops import unary_union
     
-    # Convert polygons to Shapely
+    # Convert polygons to Shapely, preserving holes
     shapely_polygons = []
     for poly_data in polygons:
-        coords = poly_data['polygon']['coordinates'][0]
-        poly = Polygon(coords)
-        if poly.is_valid:
-            shapely_polygons.append(poly)
+        rings = poly_data['polygon']['coordinates']
+        if not rings or len(rings[0]) < 3:
+            continue  # Skip invalid polygons
+        
+        try:
+            exterior = rings[0]
+            holes = rings[1:] if len(rings) > 1 else []
+            poly = Polygon(exterior, holes=holes)
+            if poly.is_valid:
+                shapely_polygons.append(poly)
+        except Exception:
+            continue
     
     if not shapely_polygons:
         return {'nodes': [], 'edges': [], 'ports': []}
     
-    # Union all polygons
+    # If exactly one channel region polygon, skip union and use it directly
+    # Only union multiple polygons when there are multiple disjoint channel regions
     if len(shapely_polygons) == 1:
         combined_poly = shapely_polygons[0]
     else:
@@ -1436,15 +1436,14 @@ def extract_graph_from_polygons(
     # Extract graph from combined polygon
     graph_result = extract_graph_from_polygon(
         combined_poly,
+        minimum_channel_width=minimum_channel_width,
         um_per_px=um_per_px,
         simplify_tolerance=simplify_tolerance,
-        auto_tune_resolution=auto_tune_resolution,
         width_sample_step=width_sample_step,
         measure_edges=measure_edges,
         default_height=default_height,
         default_cross_section_kind=default_cross_section_kind,
         per_edge_overrides=per_edge_overrides,
-        min_channel_width=min_channel_width,
         simplify_tolerance_factor=simplify_tolerance_factor,
         endpoint_merge_distance_factor=endpoint_merge_distance_factor
     )
