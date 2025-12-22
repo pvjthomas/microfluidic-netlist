@@ -21,12 +21,13 @@ def test_skeletonization():
         return
     
     print(f"\nFound {len(channel_polygons)} channel polygon(s)")
-    print(f"Extracting graph with px_per_unit=10.0...")
+    print(f"Extracting graph with minimum_channel_width=100.0 µm...")
     
     # Extract graph
+    # um_per_px will be calculated as ceil(100 / 3) = 34
     graph_result = extract_graph_from_polygons(
         channel_polygons,
-        px_per_unit=10.0,
+        minimum_channel_width=100.0,
         simplify_tolerance=1.0
     )
     

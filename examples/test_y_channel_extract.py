@@ -58,33 +58,29 @@ def extract_y_channel_graph():
     print("\n[Step 3] Extracting network graph (skeletonization)...")
     print("  Per spec: Rasterize → Skeletonize → Convert to graph")
     
-    # Determine appropriate resolution based on polygon size
+    # Determine appropriate minimum channel width based on polygon size
     if selected_polygons:
         bounds = selected_polygons[0]['bounds']
         width = bounds['xmax'] - bounds['xmin']
         height = bounds['ymax'] - bounds['ymin']
         max_dim = max(width, height)
         
-        # Adjust resolution based on size
-        # For very large coordinates (millions), use lower resolution
-        if max_dim > 1000000:
-            px_per_unit = 0.01  # Very low resolution for huge coordinates
-            simplify_tolerance = 1000.0
-        elif max_dim > 10000:
-            px_per_unit = 0.1
-            simplify_tolerance = 100.0
-        else:
-            px_per_unit = 10.0
-            simplify_tolerance = 1.0
+        # Estimate minimum channel width (use 10% of smaller dimension, with reasonable bounds)
+        min_dim = min(width, height)
+        estimated_min_width = min_dim * 0.1
+        minimum_channel_width = max(10.0, min(estimated_min_width, 1000.0))  # Between 10 and 1000 µm
+        
+        # um_per_px will be calculated as ceil(minimum_channel_width / 10)
+        simplify_tolerance = None  # Will be auto-computed
         
         print(f"  Polygon size: {max_dim:.1f} units")
-        print(f"  Using px_per_unit: {px_per_unit}")
-        print(f"  Using simplify_tolerance: {simplify_tolerance}")
+        print(f"  Estimated minimum channel width: {minimum_channel_width:.1f} µm")
+        print(f"  um_per_px will be: {__import__('math').ceil(minimum_channel_width / 10.0):.1f}")
     
     try:
         graph_result = extract_graph_from_polygons(
             selected_polygons,
-            px_per_unit=px_per_unit,
+            minimum_channel_width=minimum_channel_width,
             simplify_tolerance=simplify_tolerance
         )
         

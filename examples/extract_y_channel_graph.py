@@ -324,11 +324,22 @@ def main() -> int:
     
     try:
         with log_step("Graph extraction"):
+            # Estimate minimum channel width from polygon bounds (conservative estimate)
+            # Use 10% of the smaller dimension as a rough estimate
+            if polys_sorted:
+                first_bounds = polys_sorted[0].get('bounds', {})
+                width = first_bounds.get('xmax', 0) - first_bounds.get('xmin', 0)
+                height = first_bounds.get('ymax', 0) - first_bounds.get('ymin', 0)
+                estimated_min_width = min(width, height) * 0.1
+                minimum_channel_width = max(10.0, estimated_min_width)  # At least 10 µm
+            else:
+                minimum_channel_width = 100.0  # Default fallback
+            
+            logger.info(f"Using minimum_channel_width={minimum_channel_width:.2f} µm")
             graph_result = extract_graph_from_polygons(
                 polys_sorted,
-                um_per_px=None,  # Auto-tune based on channel width
-                simplify_tolerance=None,  # Auto-computed as 0.5 * um_per_px
-                auto_tune_resolution=True,
+                minimum_channel_width=minimum_channel_width,
+                simplify_tolerance=None,  # Auto-computed as 0.5 * minimum_channel_width
                 circles=circles if circles else None,
                 port_snap_distance=50.0,  # Snap ports within 50 µm
                 detect_polyline_circles=False,  # Don't detect circle-like polylines for now
