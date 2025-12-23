@@ -7,6 +7,8 @@ from .dxf_loader import load_dxf
 from .graph_extract import extract_graph_from_polygons
 from shapely.geometry import Polygon
 import logging
+import time
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +202,7 @@ def run_pipeline(
     snap_close_tol: float = 2.0,
     headful: bool = False,
     show_window: bool = True,
-    width_sample_step: float = 10.0,
+    width_sample_step: Optional[float] = None,
     measure_edges: bool = True,
     circles: Optional[List[Dict[str, Any]]] = None,
     port_snap_distance: float = 50.0,
@@ -228,7 +230,7 @@ def run_pipeline(
         snap_close_tol: Tolerance for auto-closing polylines
         headful: If True, show interactive visualization window
         show_window: If True and headful=True, show window (blocking). If False, just prepare data.
-        width_sample_step: Distance between width samples along centerline (default: 10.0)
+        width_sample_step: Distance between width samples along centerline (default: None, computed as minimum_channel_width / 3)
         measure_edges: If True, measure length and width profile for each edge (default: True)
         circles: Optional list of circle dicts from DXF loader for port detection
         port_snap_distance: Maximum distance to attach port to node (default: 50.0 µm)
@@ -250,42 +252,101 @@ def run_pipeline(
         - selected_polygons: Selected channel polygons
         - graph_result: Graph extraction result (None if steps C/D disabled)
         - visualizer: PipelineVisualizer instance (if headful=True)
+        - log_file: Path to the log file that was created
+        - overlay_image: Path to the overlay image (Step B polygons + graph) if generated, None otherwise
     """
+    # Set up file logging
+    dxf_file_path = Path(dxf_path)
+    dxf_filename = dxf_file_path.stem  # filename without extension
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"{dxf_filename}_{timestamp}.log"
+    
+    # Place log file in the same directory as the DXF file
+    log_file_path = dxf_file_path.parent / log_filename
+    
+    # Compute width_sample_step from minimum_channel_width if not provided
+    if width_sample_step is None:
+        width_sample_step = minimum_channel_width / 3.0
+        logger.info(f"Computed width_sample_step={width_sample_step:.1f} µm from minimum_channel_width={minimum_channel_width:.1f} µm")
+    
+    # Create file handler for logging
+    file_handler = logging.FileHandler(log_file_path, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    
+    # Add file handler to root logger (affects all loggers in the hierarchy)
+    root_logger = logging.getLogger()
+    # Store original level to restore later
+    original_level = root_logger.level if root_logger.level else logging.WARNING
+    # Set root logger to INFO to capture INFO, WARNING, ERROR messages
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    
+    # Also ensure the pipeline logger level is appropriate
+    logger.setLevel(logging.INFO)
+    
+    # Log pipeline start
+    pipeline_start_time = time.time()
+    logger.info("=" * 70)
+    logger.info(f"Pipeline started for: {dxf_path}")
+    logger.info(f"Minimum channel width: {minimum_channel_width} µm")
+    logger.info(f"Log file: {log_file_path}")
+    logger.info("=" * 70)
+    
     # Step A: Load DXF
     dxf_result = None
+    step_a_time = None
     if enable_step_a:
         logger.info("Step A: Loading DXF...")
-        dxf_result = load_dxf(dxf_path, snap_close_tol=snap_close_tol)
+        step_a_start = time.time()
+        try:
+            dxf_result = load_dxf(dxf_path, snap_close_tol=snap_close_tol)
+            step_a_time = time.time() - step_a_start
+            logger.info(f"Step A: Completed in {step_a_time:.2f}s")
+        except Exception as e:
+            step_a_time = time.time() - step_a_start
+            logger.error(f"Step A: Failed after {step_a_time:.2f}s: {e}", exc_info=True)
+            raise
     else:
         logger.info("Step A: Skipped (disabled)")
         dxf_result = {'polygons': [], 'circles': [], 'bounds': {'xmin': 0, 'ymin': 0, 'xmax': 0, 'ymax': 0}}
     
     # Step B: Select channels
     selected_polygons = []
+    step_b_time = None
     if enable_step_b and enable_step_a:
         logger.info("Step B: Selecting channels...")
-        if selected_layers is None:
-            # Select all polygons
-            candidate_polygons = dxf_result['polygons']
-        else:
-            # Select by layer
-            candidate_polygons = [
-                p for p in dxf_result['polygons']
-                if p['layer'] in selected_layers
-            ]
-        
-        # Build channel regions by subtracting contained polygons from their containers
-        # This creates difference geometries (outer - inner) that represent the actual channel regions
-        selected_polygons = build_channel_regions(candidate_polygons)
+        step_b_start = time.time()
+        try:
+            if selected_layers is None:
+                # Select all polygons
+                candidate_polygons = dxf_result['polygons']
+            else:
+                # Select by layer
+                candidate_polygons = [
+                    p for p in dxf_result['polygons']
+                    if p['layer'] in selected_layers
+                ]
+            
+            # Build channel regions by subtracting contained polygons from their containers
+            # This creates difference geometries (outer - inner) that represent the actual channel regions
+            selected_polygons = build_channel_regions(candidate_polygons)
+            step_b_time = time.time() - step_b_start
+            logger.info(f"Step B: Completed in {step_b_time:.2f}s")
+        except Exception as e:
+            step_b_time = time.time() - step_b_start
+            logger.error(f"Step B: Failed after {step_b_time:.2f}s: {e}", exc_info=True)
+            raise
     else:
         logger.info("Step B: Skipped (disabled)")
     
     # Hard maximum: um_per_px must ensure at least ~10 pixels across minimum_channel_width
     # This is critical for skeleton stability and accuracy
-    um_per_px_max = minimum_channel_width / 10.0
+    um_per_px_max = math.ceil(minimum_channel_width / 10.0)
     
     # Calculate um_per_px from minimum_channel_width (rounded up, but capped at max)
-    um_per_px_from_width = min(math.ceil(minimum_channel_width / 10.0), um_per_px_max)
+    um_per_px_from_width = um_per_px_max
     
     # Check if polygon size requires a larger um_per_px to fit within 8000 pixel limit
     # IMPORTANT: Use bounding box of selected_polygons, NOT dxf_result['bounds'],
@@ -350,25 +411,41 @@ def run_pipeline(
     
     # Step C & D: Extract graph (only if enabled and not headful)
     graph_result = None
+    step_cd_time = None
     if enable_step_c and enable_step_d and not headful:
         logger.info("Steps C & D: Extracting graph...")
-        graph_result = extract_graph_from_polygons(
-            selected_polygons,
-            minimum_channel_width=minimum_channel_width,
-            um_per_px=um_per_px,
-            simplify_tolerance=simplify_tolerance,
-            width_sample_step=width_sample_step,
-            measure_edges=measure_edges,
-            circles=circles or dxf_result.get('circles'),
-            port_snap_distance=port_snap_distance,
-            detect_polyline_circles=detect_polyline_circles,
-            circle_fit_rms_tol=circle_fit_rms_tol,
-            default_height=default_height,
-            default_cross_section_kind=default_cross_section_kind,
-            per_edge_overrides=per_edge_overrides,
-            simplify_tolerance_factor=simplify_tolerance_factor,
-            endpoint_merge_distance_factor=endpoint_merge_distance_factor
-        )
+        step_cd_start = time.time()
+        try:
+            # Create debug output directory
+            debug_output_dir = None
+            if enable_step_c and enable_step_d:
+                debug_output_dir = str(dxf_file_path.parent / f"{dxf_filename}_{timestamp}_debug")
+                logger.info(f"Debug images will be saved to: {debug_output_dir}")
+            
+            graph_result = extract_graph_from_polygons(
+                selected_polygons,
+                minimum_channel_width=minimum_channel_width,
+                um_per_px=um_per_px,
+                simplify_tolerance=simplify_tolerance,
+                width_sample_step=width_sample_step,
+                measure_edges=measure_edges,
+                circles=circles or dxf_result.get('circles'),
+                port_snap_distance=port_snap_distance,
+                detect_polyline_circles=detect_polyline_circles,
+                circle_fit_rms_tol=circle_fit_rms_tol,
+                default_height=default_height,
+                default_cross_section_kind=default_cross_section_kind,
+                per_edge_overrides=per_edge_overrides,
+                simplify_tolerance_factor=simplify_tolerance_factor,
+                endpoint_merge_distance_factor=endpoint_merge_distance_factor,
+                debug_output_dir=debug_output_dir
+            )
+            step_cd_time = time.time() - step_cd_start
+            logger.info(f"Steps C & D: Completed in {step_cd_time:.2f}s")
+        except Exception as e:
+            step_cd_time = time.time() - step_cd_start
+            logger.error(f"Steps C & D: Failed after {step_cd_time:.2f}s: {e}", exc_info=True)
+            raise
     else:
         if not enable_step_c or not enable_step_d:
             logger.info(f"Steps C & D: Skipped (C={enable_step_c}, D={enable_step_d})")
@@ -424,10 +501,60 @@ def run_pipeline(
         except ImportError:
             logger.warning("matplotlib not available, visualization disabled")
     
+    # Generate overlay image (Step B polygons + final graph)
+    overlay_image_path = None
+    if enable_step_b and enable_step_d and graph_result and selected_polygons:
+        try:
+            from .export_overlay import export_overlay_png
+            overlay_filename = f"{dxf_filename}_{timestamp}_overlay.png"
+            overlay_image_path = dxf_file_path.parent / overlay_filename
+            
+            logger.info("Generating overlay image (Step B + graph)...")
+            export_overlay_png(
+                polygons=selected_polygons,
+                nodes=graph_result.get('nodes', []),
+                edges=graph_result.get('edges', []),
+                ports=graph_result.get('ports'),
+                output_path=str(overlay_image_path),
+                image_width=2000
+            )
+            logger.info(f"Overlay image saved to: {overlay_image_path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate overlay image: {e}", exc_info=True)
+            overlay_image_path = None
+    
+    # Log pipeline completion and timing summary
+    pipeline_total_time = time.time() - pipeline_start_time
+    logger.info("=" * 70)
+    logger.info("Pipeline Timing Summary")
+    logger.info("=" * 70)
+    if step_a_time is not None:
+        logger.info(f"Step A (DXF Load): {step_a_time:.2f}s")
+    if step_b_time is not None:
+        logger.info(f"Step B (Channel Selection): {step_b_time:.2f}s")
+    if step_cd_time is not None:
+        logger.info(f"Steps C & D (Graph Extraction): {step_cd_time:.2f}s")
+    logger.info(f"Total pipeline time: {pipeline_total_time:.2f}s")
+    logger.info("=" * 70)
+    if overlay_image_path:
+        logger.info(f"Pipeline completed. Outputs:")
+        logger.info(f"  - Log file: {log_file_path}")
+        logger.info(f"  - Overlay image: {overlay_image_path}")
+    else:
+        logger.info(f"Pipeline completed. Log saved to: {log_file_path}")
+    logger.info("=" * 70)
+    
+    # Remove file handler from root logger and restore original level
+    root_logger.removeHandler(file_handler)
+    root_logger.setLevel(original_level)
+    file_handler.close()
+    
     return {
         'dxf_result': dxf_result,
         'selected_polygons': selected_polygons,
         'graph_result': graph_result,
-        'visualizer': visualizer
+        'visualizer': visualizer,
+        'log_file': str(log_file_path),
+        'overlay_image': str(overlay_image_path) if overlay_image_path else None
     }
 

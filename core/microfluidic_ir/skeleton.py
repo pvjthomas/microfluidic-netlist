@@ -354,6 +354,7 @@ def coords_to_pixel(
 def skeletonize_polygon(
     polygon: Polygon,
     um_per_px: float,
+    L_spur_cutoff: float,
     simplify_tolerance: Optional[float] = None
 ) -> Tuple[nx.Graph, Dict[str, Any]]:
     """
@@ -362,6 +363,8 @@ def skeletonize_polygon(
     Args:
         polygon: Shapely polygon to skeletonize
         um_per_px: Resolution for rasterization (microns per pixel) (required)
+        L_spur_cutoff: Maximum length in microns for spur pruning. Spurs shorter than
+                      this that end at junctions (degree >= 3) will be removed.
         simplify_tolerance: Tolerance for simplifying centerlines (in original units).
                            If None, auto-computed as 0.5 * um_per_px.
     
@@ -764,22 +767,131 @@ def skeletonize_polygon(
     total_time = time.time() - start_total
     logger.info(f"Skeleton graph: {len(G.nodes())} nodes, {len(G.edges())} edges in {node_time + edge_time:.2f}s total")
     
-    # 2. Skeleton spur pruning: iteratively delete degree-1 pixels
-    max_spur_length_px = max(5, int(50.0 / um_per_px))  # ~50 µm in pixels, minimum 5
-    logger.debug("Pruning skeleton spurs: max length = %d pixels", max_spur_length_px)
-    spurs_pruned = 0
-    for iteration in range(max_spur_length_px):
-        # Find all degree-1 nodes (potential spurs)
-        degree1_nodes = [n for n in G.nodes() if G.degree(n) == 1]
-        if not degree1_nodes:
-            break
-        
-        # Delete degree-1 nodes (they become isolated and will be removed)
-        for node in degree1_nodes:
-            G.remove_node(node)
-            spurs_pruned += 1
+    # Save skeleton image before pruning
+    try:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path("skeleton_output")
+        output_dir.mkdir(exist_ok=True)
+        output_path = output_dir / f"skeleton_before_pruning_{timestamp}.png"
+        # Convert boolean array to uint8 for saving (0=black, 255=white)
+        img_to_save = Image.fromarray((skeleton_img.astype(np.uint8) * 255), mode='L')
+        img_to_save.save(output_path)
+        logger.info(f"Saved skeleton before pruning to {output_path}")
+    except Exception as e:
+        logger.warning(f"Failed to save skeleton before pruning: {e}")
     
-    logger.info(f"Pruned {spurs_pruned} spur pixels ({iteration+1} iterations)")
+    # 2. Skeleton spur pruning: prune short spurs that end at junctions
+    logger.debug("Pruning skeleton spurs: L_spur_cutoff = %.1f µm", L_spur_cutoff)
+    
+    spurs_pruned = 0
+    max_iterations = 100  # Safety limit
+    for iteration in range(max_iterations):
+        # Find all endpoints E = {v | deg(v)=1}
+        endpoints = [n for n in G.nodes() if G.degree(n) == 1]
+        if not endpoints:
+            break  # No more endpoints to process
+        
+        paths_to_remove = []  # List of (path_nodes, terminal_node) tuples
+        
+        for endpoint in endpoints:
+            # Walk forward through degree-2 nodes
+            path = [endpoint]
+            current = endpoint
+            path_length = 0.0
+            terminal_node = None
+            
+            while True:
+                # Get neighbors
+                neighbors = list(G.neighbors(current))
+                if not neighbors:
+                    break  # No neighbors, stop
+                
+                # Find next node (for degree-1, only one neighbor; for degree-2, choose the one that's not prev)
+                if len(path) == 1:
+                    # First step: only one neighbor for degree-1
+                    next_node = neighbors[0]
+                else:
+                    # Subsequent steps: choose neighbor that's not the previous node
+                    prev_node = path[-2]
+                    next_node = None
+                    for nbr in neighbors:
+                        if nbr != prev_node:
+                            next_node = nbr
+                            break
+                    if next_node is None:
+                        break
+                
+                # Add edge weight to path length
+                if G.has_edge(current, next_node):
+                    edge_weight = G[current][next_node].get('weight', 0.0)
+                    path_length += edge_weight
+                
+                # Check if we've reached a terminal node (deg != 2)
+                next_degree = G.degree(next_node)
+                if next_degree != 2:
+                    terminal_node = next_node
+                    break
+                
+                # Continue walking
+                path.append(next_node)
+                current = next_node
+            
+            # If we reached a junction (deg >= 3) and path length <= L_spur_cutoff, mark for removal
+            if terminal_node is not None:
+                terminal_degree = G.degree(terminal_node)
+                if terminal_degree >= 3 and path_length <= L_spur_cutoff and len(path) > 1:
+                    paths_to_remove.append((path, terminal_node))
+        
+        if not paths_to_remove:
+            break  # No more spurs to remove
+        
+        # Remove marked paths
+        for path, terminal_node in paths_to_remove:
+            # Remove all nodes in the path (keep terminal_node)
+            for node in path:
+                if node in G:
+                    G.remove_node(node)
+                    spurs_pruned += 1
+        
+        logger.debug("Pruning iteration %d: removed %d nodes from %d spurs",
+                    iteration + 1, sum(len(p) for p, _ in paths_to_remove), len(paths_to_remove))
+    
+    logger.info(f"Pruned {spurs_pruned} spur pixels ({iteration+1} iterations, L_spur_cutoff={L_spur_cutoff:.1f} µm)")
+    
+    # Save skeleton image after pruning
+    try:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path("skeleton_output")
+        output_dir.mkdir(exist_ok=True)
+        output_path = output_dir / f"skeleton_after_pruning_{timestamp}.png"
+        
+        # Reconstruct skeleton image from remaining graph nodes
+        # Use the same dimensions as the original skeleton_img
+        skeleton_img_after = np.zeros_like(skeleton_img, dtype=bool)
+        
+        # Convert each remaining node's coordinates back to pixel coordinates
+        for node_id in G.nodes():
+            x, y = G.nodes[node_id]['xy']
+            # Note: coords_to_pixel returns (row, col), but we need to account for the flip
+            # The original skeleton_img was flipped with np.flipud, so row 0 in the image
+            # corresponds to max_y in coordinates. We need to invert the row.
+            row, col = coords_to_pixel(x, y, transform)
+            # Invert row to match the flipped image coordinate system
+            img_height = skeleton_img.shape[0]
+            inverted_row = img_height - 1 - row
+            
+            # Check bounds and set pixel
+            if 0 <= inverted_row < skeleton_img.shape[0] and 0 <= col < skeleton_img.shape[1]:
+                skeleton_img_after[inverted_row, col] = True
+        
+        # Convert boolean array to uint8 for saving (0=black, 255=white)
+        img_to_save = Image.fromarray((skeleton_img_after.astype(np.uint8) * 255), mode='L')
+        img_to_save.save(output_path)
+        logger.info(f"Saved skeleton after pruning to {output_path}")
+    except Exception as e:
+        logger.warning(f"Failed to save skeleton after pruning: {e}")
     
     logger.debug("skeletonize_polygon: complete, total time: %.2fs", total_time)
     
@@ -938,33 +1050,25 @@ def extract_skeleton_paths(
     
     logger.debug("extract_skeleton_paths: extracted %d paths before simplification", len(paths))
     
-    # Simplify paths using Douglas-Peucker-like approach (if tolerance specified)
+    # Simplify paths using corner-preserving collinear removal (if tolerance specified)
     if simplify_tolerance is not None and simplify_tolerance > 0:
-        logger.debug("extract_skeleton_paths: simplifying %d paths with tolerance=%.3f", len(paths), simplify_tolerance)
-        from shapely.geometry import LineString
+        logger.debug("extract_skeleton_paths: simplifying %d paths with corner-preserving method", len(paths))
         simplified_paths = []
         try:
             for idx, path in enumerate(paths):
                 if idx % 10 == 0 and idx > 0:
                     logger.debug("extract_skeleton_paths: simplified %d/%d paths", idx, len(paths))
-                if len(path) < 2:
-                    logger.debug("extract_skeleton_paths: skipping path %d (too short: %d points)", idx, len(path))
+                if len(path) < 3:
+                    # Too short to simplify, keep as-is
+                    simplified_paths.append(path)
                     continue
                 try:
-                    line = LineString(path)
-                    simplified = line.simplify(simplify_tolerance, preserve_topology=False)
-                    if simplified.geom_type == 'LineString':
-                        simplified_paths.append(list(simplified.coords))
-                    else:
-                        # MultiLineString - take longest segment
-                        if hasattr(simplified, 'geoms'):
-                            longest = max(simplified.geoms, key=lambda g: g.length)
-                            simplified_paths.append(list(longest.coords))
-                        else:
-                            logger.warning("extract_skeleton_paths: path %d simplified to unexpected type: %s",
-                                          idx, simplified.geom_type)
+                    # Use corner-preserving collinear simplification (angle threshold ≈ 3 degrees)
+                    simplified = simplify_path_collinear(path, angle_threshold_deg=3.0)
+                    simplified_paths.append(simplified)
                 except Exception as e:
-                    logger.warning("extract_skeleton_paths: failed to simplify path %d: %s", idx, e)
+                    logger.warning("extract_skeleton_paths: failed to simplify path %d: %s, using original", idx, e)
+                    simplified_paths.append(path)
                     continue
         except Exception as e:
             logger.error("extract_skeleton_paths: failed during path simplification: %s", e, exc_info=True)
@@ -1361,6 +1465,247 @@ def compute_cluster_centroid(
     cy = sum(y_coords) / len(y_coords)
     
     return (cx, cy)
+
+
+def find_cluster_representative(
+    skeleton_graph: nx.Graph,
+    cluster_nodes: List[int]
+) -> int:
+    """
+    Find the representative node for a cluster (closest to centroid).
+    
+    Args:
+        skeleton_graph: NetworkX graph
+        cluster_nodes: List of node IDs in cluster
+        
+    Returns:
+        Node ID closest to cluster centroid
+    """
+    if not cluster_nodes:
+        raise ValueError("Empty cluster")
+    if len(cluster_nodes) == 1:
+        return cluster_nodes[0]
+    
+    centroid = compute_cluster_centroid(skeleton_graph, cluster_nodes)
+    centroid_point = Point(centroid)
+    
+    # Find node closest to centroid
+    min_dist = float('inf')
+    rep_node = cluster_nodes[0]
+    
+    for node_id in cluster_nodes:
+        node_xy = skeleton_graph.nodes[node_id]['xy']
+        node_point = Point(node_xy)
+        dist = centroid_point.distance(node_point)
+        if dist < min_dist:
+            min_dist = dist
+            rep_node = node_id
+    
+    return rep_node
+
+
+def validate_junction_cluster_arms(
+    skeleton_graph: nx.Graph,
+    cluster_nodes: List[int]
+) -> int:
+    """
+    Count the number of "arms" (connected components) attached to a junction cluster.
+    
+    This validates that a cluster is a true junction (arms >= 3) vs. a corner artifact.
+    
+    Algorithm:
+    1. Remove cluster nodes from graph
+    2. Find all neighbors of cluster nodes (outside the cluster)
+    3. Count how many connected components those neighbors belong to in the reduced graph
+    4. That count = number of arms
+    
+    Args:
+        skeleton_graph: NetworkX graph
+        cluster_nodes: List of node IDs in the cluster
+        
+    Returns:
+        Number of arms (connected components attached to cluster)
+    """
+    if not cluster_nodes:
+        return 0
+    
+    cluster_set = set(cluster_nodes)
+    
+    # Find all neighbors of cluster nodes that are outside the cluster
+    external_neighbors = set()
+    for node_id in cluster_nodes:
+        for neighbor in skeleton_graph.neighbors(node_id):
+            if neighbor not in cluster_set:
+                external_neighbors.add(neighbor)
+    
+    if not external_neighbors:
+        return 0
+    
+    # Create graph without cluster nodes
+    all_nodes_except_cluster = set(skeleton_graph.nodes()) - cluster_set
+    reduced_graph = skeleton_graph.subgraph(all_nodes_except_cluster).copy()
+    
+    # Count connected components that contain external neighbors
+    neighbor_components = set()
+    for component in nx.connected_components(reduced_graph):
+        if component & external_neighbors:  # If component contains any external neighbor
+            neighbor_components.add(frozenset(component))
+    
+    num_arms = len(neighbor_components)
+    return num_arms
+
+
+def contract_junction_clusters(
+    skeleton_graph: nx.Graph,
+    junction_clusters: Dict[int, List[int]],
+    min_arms: int = 3
+) -> Tuple[nx.Graph, Dict[int, int]]:
+    """
+    Contract junction clusters into single representative nodes.
+    
+    Only contracts clusters that have >= min_arms (validates true junctions).
+    Invalid clusters (corners) are left as-is.
+    
+    Args:
+        skeleton_graph: Original NetworkX graph
+        junction_clusters: Dict mapping cluster_id to list of node IDs
+        min_arms: Minimum number of arms to consider cluster valid (default: 3)
+        
+    Returns:
+        Tuple of (contracted_graph, cluster_rep_map) where:
+        - contracted_graph: New graph with clusters contracted to single nodes
+        - cluster_rep_map: Dict mapping original node_id -> representative node_id for clusters
+    """
+    # Create a copy of the graph
+    contracted = skeleton_graph.copy()
+    cluster_rep_map = {}  # Maps original node_id -> rep node_id
+    
+    # Find valid clusters (arms >= min_arms) and their representatives
+    valid_clusters = {}
+    for cluster_id, cluster_nodes in junction_clusters.items():
+        num_arms = validate_junction_cluster_arms(skeleton_graph, cluster_nodes)
+        if num_arms >= min_arms:
+            rep_node = find_cluster_representative(skeleton_graph, cluster_nodes)
+            valid_clusters[cluster_id] = (cluster_nodes, rep_node)
+            logger.debug("Junction cluster %d: %d nodes, %d arms, rep=%d", 
+                        cluster_id, len(cluster_nodes), num_arms, rep_node)
+        else:
+            logger.debug("Junction cluster %d: %d nodes, %d arms (rejected, < %d arms)", 
+                        cluster_id, len(cluster_nodes), num_arms, min_arms)
+    
+    # Contract each valid cluster
+    for cluster_id, (cluster_nodes, rep_node) in valid_clusters.items():
+        cluster_set = set(cluster_nodes)
+        
+        # Update rep node position to centroid
+        centroid = compute_cluster_centroid(skeleton_graph, cluster_nodes)
+        contracted.nodes[rep_node]['xy'] = list(centroid)
+        
+        # Map all cluster nodes to rep
+        for node_id in cluster_nodes:
+            cluster_rep_map[node_id] = rep_node
+        
+        # For each cluster node, redirect its external neighbors to rep_node
+        nodes_to_remove = []
+        for node_id in cluster_nodes:
+            if node_id == rep_node:
+                continue  # Keep rep node
+            
+            # Get neighbors outside the cluster
+            for neighbor in list(contracted.neighbors(node_id)):
+                if neighbor not in cluster_set:
+                    # Add edge from rep to neighbor (if doesn't exist)
+                    if not contracted.has_edge(rep_node, neighbor):
+                        # Copy edge data if exists
+                        if contracted.has_edge(node_id, neighbor):
+                            edge_data = contracted.edges[node_id, neighbor]
+                            contracted.add_edge(rep_node, neighbor, **edge_data)
+                        else:
+                            contracted.add_edge(rep_node, neighbor)
+            
+            nodes_to_remove.append(node_id)
+        
+        # Remove cluster nodes (except rep)
+        for node_id in nodes_to_remove:
+            contracted.remove_node(node_id)
+    
+    logger.info("Contracted %d/%d junction clusters (min_arms=%d)", 
+               len(valid_clusters), len(junction_clusters), min_arms)
+    
+    return contracted, cluster_rep_map
+
+
+def simplify_path_collinear(
+    path: List[Tuple[float, float]],
+    angle_threshold_deg: float = 3.0
+) -> List[Tuple[float, float]]:
+    """
+    Simplify path by removing collinear points (corner-preserving).
+    
+    Unlike Shapely's simplify(), this preserves right angles and sharp corners
+    by only removing points that are nearly collinear with their neighbors.
+    
+    Args:
+        path: List of (x, y) coordinates
+        angle_threshold_deg: Maximum angle (in degrees) to consider collinear (default: 3.0)
+        
+    Returns:
+        Simplified path with collinear points removed
+    """
+    if len(path) < 3:
+        return path
+    
+    import math
+    
+    angle_threshold_rad = math.radians(angle_threshold_deg)
+    
+    # Always keep first point
+    simplified = [path[0]]
+    
+    for i in range(1, len(path) - 1):
+        # Compute vectors: from prev to current, and from current to next
+        prev_x, prev_y = path[i-1]
+        curr_x, curr_y = path[i]
+        next_x, next_y = path[i+1]
+        
+        vec1_x = curr_x - prev_x
+        vec1_y = curr_y - prev_y
+        vec2_x = next_x - curr_x
+        vec2_y = next_y - curr_y
+        
+        # Compute lengths
+        len1 = math.sqrt(vec1_x*vec1_x + vec1_y*vec1_y)
+        len2 = math.sqrt(vec2_x*vec2_x + vec2_y*vec2_y)
+        
+        if len1 < 1e-10 or len2 < 1e-10:
+            # Degenerate edge, keep the point
+            simplified.append(path[i])
+            continue
+        
+        # Normalize vectors
+        vec1_x /= len1
+        vec1_y /= len1
+        vec2_x /= len2
+        vec2_y /= len2
+        
+        # Compute dot product (cosine of angle)
+        dot_product = vec1_x * vec2_x + vec1_y * vec2_y
+        
+        # Clamp to [-1, 1] for numerical stability
+        dot_product = max(-1.0, min(1.0, dot_product))
+        
+        # Compute angle
+        angle = math.acos(dot_product)
+        turn_angle = math.pi - angle  # Turn angle (0 = straight, pi = 180 deg turn)
+        
+        # Keep point if turn angle is significant
+        if turn_angle > angle_threshold_rad:
+            simplified.append(path[i])
+    
+    # Always keep last point
+    simplified.append(path[-1])
+    
+    return simplified
 
 
 def merge_close_endpoints(

@@ -12,7 +12,10 @@ from .skeleton import (
     extract_skeleton_paths,
     cluster_junction_pixels,
     compute_cluster_centroid,
-    merge_close_endpoints
+    merge_close_endpoints,
+    validate_junction_cluster_arms,
+    contract_junction_clusters,
+    find_cluster_representative
 )
 from .measure import measure_edge
 from .classify import classify_width_profile
@@ -755,18 +758,239 @@ def re_center_junctions(
                     node_id, old_xy[0], old_xy[1], new_x, new_y)
 
 
+def split_edge_at_corners(
+    centerline_coords: List[Tuple[float, float]],
+    um_per_px: float,
+    turn_thresh_deg: float = 30.0,
+    min_leg: float = None
+) -> List[int]:
+    """
+    Detect corner points on a polyline using direction-change (H↔V) or turning angle threshold.
+    
+    Args:
+        centerline_coords: List of (x, y) coordinates
+        um_per_px: Resolution in microns per pixel
+        turn_thresh_deg: Minimum turning angle in degrees to consider a corner (default: 30.0)
+        min_leg: Minimum leg length in µm between corners (default: 2*um_per_px)
+        
+    Returns:
+        List of indices where corners are detected (including first and last indices)
+    """
+    import math
+    
+    if len(centerline_coords) < 3:
+        # Too short to have corners, return endpoints
+        return [0, len(centerline_coords) - 1] if len(centerline_coords) >= 2 else [0]
+    
+    if min_leg is None:
+        min_leg = 2.0 * um_per_px
+    
+    turn_thresh_rad = math.radians(turn_thresh_deg)
+    
+    # Always include first point
+    corner_indices = [0]
+    
+    for i in range(1, len(centerline_coords) - 1):
+        prev_x, prev_y = centerline_coords[i-1]
+        curr_x, curr_y = centerline_coords[i]
+        next_x, next_y = centerline_coords[i+1]
+        
+        # Compute vectors
+        vec1_x = curr_x - prev_x
+        vec1_y = curr_y - prev_y
+        vec2_x = next_x - curr_x
+        vec2_y = next_y - curr_y
+        
+        # Compute lengths
+        len1 = math.sqrt(vec1_x*vec1_x + vec1_y*vec1_y)
+        len2 = math.sqrt(vec2_x*vec2_x + vec2_y*vec2_y)
+        
+        if len1 < 1e-10 or len2 < 1e-10:
+            continue  # Degenerate edge, skip
+        
+        # Check for horizontal/vertical direction change (H↔V)
+        # Normalize to unit vectors
+        vec1_x /= len1
+        vec1_y /= len1
+        vec2_x /= len2
+        vec2_y /= len2
+        
+        # Check if directions are approximately horizontal or vertical
+        is_h1 = abs(vec1_y) < 0.1  # Approximately horizontal
+        is_v1 = abs(vec1_x) < 0.1  # Approximately vertical
+        is_h2 = abs(vec2_y) < 0.1
+        is_v2 = abs(vec2_x) < 0.1
+        
+        # H↔V transition
+        hv_transition = (is_h1 and is_v2) or (is_v1 and is_h2)
+        
+        # Compute turning angle
+        dot_product = vec1_x * vec2_x + vec1_y * vec2_y
+        dot_product = max(-1.0, min(1.0, dot_product))  # Clamp for numerical stability
+        angle = math.acos(dot_product)
+        turn_angle = math.pi - angle  # Turn angle (0 = straight, pi = 180 deg turn)
+        
+        # Check if this is a corner
+        is_corner = False
+        if hv_transition:
+            is_corner = True
+        elif turn_angle > turn_thresh_rad:
+            is_corner = True
+        
+        if is_corner:
+            # Check minimum leg length from previous corner
+            if corner_indices:
+                prev_corner_idx = corner_indices[-1]
+                prev_corner_x, prev_corner_y = centerline_coords[prev_corner_idx]
+                leg_length = math.sqrt(
+                    (curr_x - prev_corner_x)**2 + (curr_y - prev_corner_y)**2
+                )
+                if leg_length >= min_leg:
+                    corner_indices.append(i)
+            else:
+                corner_indices.append(i)
+    
+    # Always include last point
+    if corner_indices[-1] != len(centerline_coords) - 1:
+        corner_indices.append(len(centerline_coords) - 1)
+    
+    return corner_indices
+
+
+def build_edges_by_terminal_walk(
+    contracted_graph: nx.Graph,
+    terminals: set,
+    skeleton_node_to_true_node: Dict[int, int],
+    nodes: List[Dict[str, Any]],
+    um_per_px: float
+) -> List[Dict[str, Any]]:
+    """
+    Build edges by deterministic edge-walk decomposition from terminals.
+    
+    Walks from each terminal along neighbors through degree-2 nodes until the next terminal,
+    marking traversed edges as visited so each skeleton edge is used exactly once.
+    
+    Args:
+        contracted_graph: NetworkX graph after junction contraction
+        terminals: Set of terminal skeleton node IDs (endpoint reps + junction reps with degree >= 3)
+        skeleton_node_to_true_node: Map from skeleton node ID to true node index
+        nodes: List of true nodes (for looking up node IDs)
+        um_per_px: Resolution in microns per pixel
+        
+    Returns:
+        List of edge dicts with centerline coordinates
+    """
+    edges = []
+    edge_counter = 1
+    visited_edges = set()  # Set of (u, v) tuples (undirected edges)
+    degrees = dict(contracted_graph.degree())
+    
+    # Helper to get edge key (undirected)
+    def edge_key(u, v):
+        return tuple(sorted([u, v]))
+    
+    # Walk from each terminal
+    for start_terminal in terminals:
+        # Find all unvisited neighbors
+        for neighbor in contracted_graph.neighbors(start_terminal):
+            edge_key_start = edge_key(start_terminal, neighbor)
+            if edge_key_start in visited_edges:
+                continue  # Already visited this edge
+            
+            # Start walking from this neighbor
+            path = [start_terminal, neighbor]
+            prev = start_terminal
+            current = neighbor
+            visited_edges.add(edge_key_start)
+            
+            # Walk through degree-2 nodes until we hit a terminal
+            while True:
+                # Check if current is a terminal
+                if current in terminals:
+                    # Found path from start_terminal to current terminal
+                    break
+                
+                # Check if current has degree 2 (continue walking)
+                if degrees.get(current, 0) != 2:
+                    # Not a terminal and not degree-2, something went wrong
+                    logger.warning(f"Walk from terminal {start_terminal} hit non-terminal, non-degree-2 node {current}")
+                    break
+                
+                # For degree-2 nodes, there are exactly 2 neighbors
+                # Choose the neighbor that's not prev
+                nbrs = list(contracted_graph.neighbors(current))
+                if len(nbrs) != 2:
+                    logger.warning(f"Degree-2 node {current} has {len(nbrs)} neighbors, expected 2")
+                    break
+                
+                next_node = nbrs[0] if nbrs[1] == prev else nbrs[1]
+                
+                # Check if we've already walked this undirected edge
+                ek = edge_key(current, next_node)
+                if ek in visited_edges:
+                    # We've already walked this undirected edge; stop
+                    break
+                
+                visited_edges.add(ek)
+                path.append(next_node)
+                prev, current = current, next_node
+            
+            # If we found a path to another terminal, create edge
+            if len(path) >= 2 and current in terminals and current != start_terminal:
+                # Get true node IDs
+                start_true_idx = skeleton_node_to_true_node.get(start_terminal)
+                end_true_idx = skeleton_node_to_true_node.get(current)
+                
+                if start_true_idx is not None and end_true_idx is not None:
+                    start_node = nodes[start_true_idx]
+                    end_node = nodes[end_true_idx]
+                    
+                    # Extract coordinates from path
+                    path_coords = [contracted_graph.nodes[n]['xy'] for n in path]
+                    
+                    # Apply collinearity pruning (remove points where turn angle ~ 0)
+                    from .skeleton import simplify_path_collinear
+                    pruned_coords = simplify_path_collinear(path_coords, angle_threshold_deg=3.0)
+                    
+                    if len(pruned_coords) >= 2:
+                        edge_id = f"E{edge_counter}"
+                        edge_counter += 1
+                        
+                        edges.append({
+                            'id': edge_id,
+                            'u': start_node['id'],
+                            'v': end_node['id'],
+                            'centerline': {
+                                'type': 'LineString',
+                                'coordinates': [[float(x), float(y)] for x, y in pruned_coords]
+                            }
+                        })
+    
+    # Debug logging if no edges found
+    if len(edges) == 0 and terminals:
+        # Log one terminal's neighbor list and degrees for debugging
+        sample_terminal = next(iter(terminals))
+        neighbors = list(contracted_graph.neighbors(sample_terminal))
+        neighbor_degrees = {n: degrees.get(n, 0) for n in neighbors}
+        logger.warning("No edges found from terminal walk. Sample terminal %d: degree=%d, neighbors=%s, neighbor_degrees=%s",
+                      sample_terminal, degrees.get(sample_terminal, 0), neighbors, neighbor_degrees)
+    
+    return edges
+
+
 def extract_graph_from_polygon(
     polygon: Any,  # Shapely Polygon
     minimum_channel_width: float,
     um_per_px: float,
     simplify_tolerance: Optional[float] = None,
-    width_sample_step: float = 10.0,
+    width_sample_step: Optional[float] = None,
     measure_edges: bool = True,
     default_height: float = 50.0,
     default_cross_section_kind: str = "rectangular",
     per_edge_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     simplify_tolerance_factor: float = 0.5,
-    endpoint_merge_distance_factor: float = 1.0
+    endpoint_merge_distance_factor: float = 1.0,
+    debug_output_dir: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Extract network graph from a polygon.
@@ -776,7 +1000,7 @@ def extract_graph_from_polygon(
         minimum_channel_width: Minimum channel width in micrometers (required)
         um_per_px: Resolution for skeletonization (microns per pixel) (required)
         simplify_tolerance: Tolerance for path simplification. If None, computed as simplify_tolerance_factor * minimum_channel_width.
-        width_sample_step: Distance between width samples along centerline (default: 10.0)
+        width_sample_step: Distance between width samples along centerline (default: None, computed as minimum_channel_width / 3)
         measure_edges: If True, measure length and width profile for each edge (default: True)
         default_height: Default height in micrometers (default: 50.0)
         default_cross_section_kind: Default cross-section type (default: "rectangular")
@@ -791,13 +1015,35 @@ def extract_graph_from_polygon(
         - skeleton_graph: NetworkX graph (for debugging)
         - transform: Transform dictionary with um_per_px
     """
+    # Compute width_sample_step from minimum_channel_width if not provided
+    if width_sample_step is None:
+        width_sample_step = minimum_channel_width / 3.0
+        logger.debug(f"Computed width_sample_step={width_sample_step:.1f} µm from minimum_channel_width={minimum_channel_width:.1f} µm")
+    
     # Skeletonize polygon
     logger.info("Building graph from skeleton")
     skeleton_graph, transform = skeletonize_polygon(
         polygon,
         um_per_px=um_per_px,
+        L_spur_cutoff=minimum_channel_width,
         simplify_tolerance=simplify_tolerance
     )
+    
+    # Export debug image: C_skeleton (after skeletonization)
+    if debug_output_dir:
+        try:
+            from .export_debug import export_debug_image
+            import os
+            os.makedirs(debug_output_dir, exist_ok=True)
+            debug_path = os.path.join(debug_output_dir, "C_skeleton.png")
+            export_debug_image(
+                step_name="C_skeleton",
+                output_path=debug_path,
+                skeleton_graph=skeleton_graph
+            )
+            logger.debug("Debug image saved: %s", debug_path)
+        except Exception as e:
+            logger.warning("Failed to export debug image C_skeleton: %s", e)
     
     if len(skeleton_graph) == 0:
         logger.info("Empty skeleton graph")
@@ -816,22 +1062,57 @@ def extract_graph_from_polygon(
     
     logger.debug("extract_graph_from_polygon: using minimum_channel_width=%.2f µm", minimum_channel_width)
     
-    # A) Cluster junction pixels into connected components
+    # A) Cluster junction pixels and contract valid clusters (D'2, D'3)
     import time
     start = time.time()
     
-    junction_clusters = cluster_junction_pixels(skeleton_graph, um_per_px)
-    logger.info(f"Clustered {sum(len(v) for v in junction_clusters.values())} junction pixels into {len(junction_clusters)} junction clusters")
+    junction_clusters_raw = cluster_junction_pixels(skeleton_graph, um_per_px)
+    logger.info(f"Clustered {sum(len(v) for v in junction_clusters_raw.values())} junction pixels into {len(junction_clusters_raw)} junction clusters")
     
-    # Build forbidden set from junction pixels (for endpoint merging guard)
+    # D'3: Validate and D'2: Contract junction clusters (min_arms=3)
+    # This reduces density by treating each blob as one terminal
+    contracted_graph, cluster_rep_map = contract_junction_clusters(
+        skeleton_graph, 
+        junction_clusters_raw, 
+        min_arms=3
+    )
+    
+    # Update junction_clusters to only include contracted (valid) clusters
+    # Map from cluster_id -> [rep_node] (now just the representative)
+    junction_clusters = {}
+    for cluster_id, cluster_nodes in junction_clusters_raw.items():
+        # Check if this cluster was contracted (has a rep)
+        if cluster_nodes[0] in cluster_rep_map:
+            rep_node = cluster_rep_map[cluster_nodes[0]]
+            # All nodes in cluster map to same rep
+            junction_clusters[cluster_id] = [rep_node]
+    
+    # Export debug image: C2_contracted (after cluster contraction)
+    if debug_output_dir:
+        try:
+            from .export_debug import export_debug_image
+            debug_path = os.path.join(debug_output_dir, "C2_contracted.png")
+            export_debug_image(
+                step_name="C2_contracted",
+                output_path=debug_path,
+                skeleton_graph=skeleton_graph,
+                contracted_graph=contracted_graph,
+                junction_clusters=junction_clusters_raw,
+                cluster_rep_map=cluster_rep_map
+            )
+            logger.debug("Debug image saved: %s", debug_path)
+        except Exception as e:
+            logger.warning("Failed to export debug image C2_contracted: %s", e)
+    
+    # Build forbidden set from contracted junction nodes (for endpoint merging guard)
     forbidden_nodes = set()
     for cluster_nodes in junction_clusters.values():
         forbidden_nodes.update(cluster_nodes)
-    logger.debug(f"Built forbidden set with {len(forbidden_nodes)} junction pixels")
+    logger.debug(f"Built forbidden set with {len(forbidden_nodes)} contracted junction nodes")
     
-    # Identify endpoints (before merging)
-    endpoint_nodes = [n for n in skeleton_graph.nodes() if skeleton_graph.degree(n) == 1]
-    logger.info(f"Found {len(endpoint_nodes)} endpoint pixels")
+    # Identify endpoints in contracted graph (before merging)
+    endpoint_nodes = [n for n in contracted_graph.nodes() if contracted_graph.degree(n) == 1]
+    logger.info(f"Found {len(endpoint_nodes)} endpoint pixels in contracted graph")
     
     # B) Merge close endpoints using topology-aware pixel-based merging
     # Use pixel-scale: min(2.0 * um_per_px, 0.2 * minimum_channel_width) * factor
@@ -840,7 +1121,7 @@ def extract_graph_from_polygon(
     logger.debug("extract_graph_from_polygon: endpoint_merge_distance=%.2f µm (pixel-based: min(2.0×%.2f, 0.2×%.2f)×%.2f)",
                  endpoint_merge_distance, um_per_px, minimum_channel_width, endpoint_merge_distance_factor)
     endpoint_clusters = merge_close_endpoints(
-        skeleton_graph, 
+        contracted_graph,  # Use contracted graph
         endpoint_nodes, 
         endpoint_merge_distance,
         um_per_px=um_per_px,
@@ -848,36 +1129,43 @@ def extract_graph_from_polygon(
     )
     logger.info(f"Merged {len(endpoint_nodes)} endpoints into {len(endpoint_clusters)} endpoint clusters (topology-aware)")
     
-    # Build true nodes from clusters
+    # Build true nodes from clusters (using contracted graph)
     true_nodes = {}  # Map from internal node_id to (x, y)
     nodes = []
     node_counter = 1
     cluster_to_node_id = {}
     
-    # Add junction clusters
+    # Map from skeleton node ID (in contracted graph) to true node ID
+    skeleton_node_to_true_node = {}
+    
+    # Add junction clusters (now just single rep nodes)
     for cluster_id, cluster_nodes in junction_clusters.items():
-        centroid = compute_cluster_centroid(skeleton_graph, cluster_nodes)
+        # cluster_nodes now contains just the rep node after contraction
+        rep_node = cluster_nodes[0]
+        xy = list(contracted_graph.nodes[rep_node]['xy'])
         node_id = f"N{node_counter}"
+        true_node_idx = node_counter - 1  # 0-indexed position in nodes list
         node_counter += 1
-        true_nodes[node_counter - 1] = centroid
-        cluster_to_node_id[('junction', cluster_id)] = node_counter - 1
+        true_nodes[true_node_idx] = tuple(xy)
+        cluster_to_node_id[('junction', cluster_id)] = true_node_idx
+        skeleton_node_to_true_node[rep_node] = true_node_idx
         
         nodes.append({
             'id': node_id,
-            'xy': list(centroid),
+            'xy': xy,
             'kind': 'junction',
-            'degree': len(cluster_nodes),
+            'degree': contracted_graph.degree(rep_node),  # Degree in contracted graph
             'cluster_nodes': cluster_nodes  # Store for reference
         })
     
     # Add endpoint clusters
     for cluster_id, cluster_nodes in endpoint_clusters.items():
         if len(cluster_nodes) == 1:
-            centroid = skeleton_graph.nodes[cluster_nodes[0]]['xy']
+            centroid = contracted_graph.nodes[cluster_nodes[0]]['xy']
             endpoint_node_id = cluster_nodes[0]
         else:
             # Use centroid of merged endpoints
-            centroid = compute_cluster_centroid(skeleton_graph, cluster_nodes)
+            centroid = compute_cluster_centroid(contracted_graph, cluster_nodes)
             # Use the first node for direction finding
             endpoint_node_id = cluster_nodes[0]
         
@@ -886,15 +1174,20 @@ def extract_graph_from_polygon(
         snapped_xy = snap_endpoint_to_boundary(
             centroid,
             polygon,
-            skeleton_graph,
+            contracted_graph,  # Use contracted graph
             endpoint_node_id,
             incident_edge_coords=None
         )
         
         node_id = f"N{node_counter}"
+        true_node_idx = node_counter - 1  # 0-indexed position in nodes list
         node_counter += 1
-        true_nodes[node_counter - 1] = snapped_xy
-        cluster_to_node_id[('endpoint', cluster_id)] = node_counter - 1
+        true_nodes[true_node_idx] = snapped_xy
+        cluster_to_node_id[('endpoint', cluster_id)] = true_node_idx
+        
+        # Map all endpoint cluster nodes to this true node
+        for s_node in cluster_nodes:
+            skeleton_node_to_true_node[s_node] = true_node_idx
         
         nodes.append({
             'id': node_id,
@@ -913,163 +1206,185 @@ def extract_graph_from_polygon(
     node_build_time = time.time() - start
     logger.info(f"  Built {len(nodes)} true nodes ({len(junction_clusters)} junctions, {len(endpoint_clusters)} endpoints) in {node_build_time:.2f}s")
     
-    # C) Rebuild edges by walking from node to node (collapsing degree-2 chains)
+    # Export debug image: D_nodes (after node building)
+    if debug_output_dir:
+        try:
+            from .export_debug import export_debug_image
+            debug_path = os.path.join(debug_output_dir, "D_nodes.png")
+            export_debug_image(
+                step_name="D_nodes",
+                output_path=debug_path,
+                skeleton_graph=skeleton_graph,
+                contracted_graph=contracted_graph,
+                junction_clusters=junction_clusters,
+                endpoint_clusters=endpoint_clusters,
+                nodes=nodes
+            )
+            logger.debug("Debug image saved: %s", debug_path)
+        except Exception as e:
+            logger.warning("Failed to export debug image D_nodes: %s", e)
+    
+    # C) Rebuild edges by deterministic edge-walk decomposition from terminals
+    # Build terminal set: endpoint reps + junction reps with degree >= 3
     start = time.time()
-    edges = []
-    edge_counter = 1
+    terminals = set()
+    degrees = dict(contracted_graph.degree())
     
-    # Create mapping: for each true node, find skeleton nodes it represents
-    true_node_to_skeleton_nodes = {}
-    for node in nodes:
-        skeleton_nodes = node.get('cluster_nodes', [])
-        if skeleton_nodes:
-            true_node_id = int(node['id'][1:]) - 1  # Extract number from "N1" -> 0
-            true_node_to_skeleton_nodes[true_node_id] = skeleton_nodes
+    # Add endpoint reps (from endpoint clusters)
+    # Use one rep per endpoint cluster (not all nodes in cluster)
+    # Even if the walk is fixed, having multiple terminals at one endpoint can cause tiny degenerate edges
+    for cluster_nodes in endpoint_clusters.values():
+        rep = next((n for n in cluster_nodes if degrees.get(n, 0) == 1), cluster_nodes[0])
+        terminals.add(rep)
     
-    # Walk from each true node to find edges to other true nodes
-    visited_edges = set()
+    # Add junction reps (from contracted junction clusters where degree >= 3)
+    for cluster_nodes in junction_clusters.values():
+        for rep_node in cluster_nodes:
+            if degrees.get(rep_node, 0) >= 3:
+                terminals.add(rep_node)
     
-    for i, node1 in enumerate(nodes):
-        true_id1 = int(node1['id'][1:]) - 1
-        skeleton_nodes1 = true_node_to_skeleton_nodes.get(true_id1, [])
-        if not skeleton_nodes1:
-            continue
+    logger.info("contracted_graph: %d nodes, %d edges", contracted_graph.number_of_nodes(), contracted_graph.number_of_edges())
+    logger.info("terminals: %d, endpoint_terms=%d, junction_terms=%d",
+                len(terminals),
+                sum(1 for t in terminals if degrees.get(t, 0) == 1),
+                sum(1 for t in terminals if degrees.get(t, 0) >= 3))
+    
+    # Build edges by terminal walk
+    edges = build_edges_by_terminal_walk(
+        contracted_graph,
+        terminals,
+        skeleton_node_to_true_node,
+        nodes,
+        um_per_px
+    )
+    
+    # Detect corners and split edges at corner points
+    # This creates "corner" nodes (degree-2 topologically) and splits polylines
+    edge_counter = len(edges) + 1
+    new_edges = []
+    corner_nodes = []  # New corner nodes to add
+    corner_node_counter = len(nodes) + 1
+    
+    for edge in edges:
+        centerline_coords = [tuple(c) for c in edge['centerline']['coordinates']]
+        corner_indices = split_edge_at_corners(centerline_coords, um_per_px, turn_thresh_deg=30.0)
         
-        for j, node2 in enumerate(nodes[i+1:], start=i+1):
-            true_id2 = int(node2['id'][1:]) - 1
-            skeleton_nodes2 = true_node_to_skeleton_nodes.get(true_id2, [])
-            if not skeleton_nodes2:
-                continue
+        # Dedupe and sort corner indices before use
+        corner_indices = sorted(set(corner_indices))
+        
+        if len(corner_indices) <= 2:
+            # No corners detected, keep edge as-is
+            new_edges.append(edge)
+        else:
+            # Split edge at corners
+            u_node_id = edge['u']
+            v_node_id = edge['v']
             
-            # Try to find path between any skeleton node of node1 to any of node2
-            path_coords = None
-            for s1 in skeleton_nodes1:
-                for s2 in skeleton_nodes2:
-                    if s1 == s2:
-                        continue
+            # Get u and v node objects
+            u_node = next(n for n in nodes if n['id'] == u_node_id)
+            v_node = next(n for n in nodes if n['id'] == v_node_id)
+            
+            # Create corner nodes and split edges
+            prev_node_id = u_node_id
+            for i in range(1, len(corner_indices)):
+                corner_idx = corner_indices[i]
+                if i == len(corner_indices) - 1:
+                    # Last segment connects to v
+                    next_node_id = v_node_id
+                else:
+                    # Create corner node
+                    corner_xy = centerline_coords[corner_idx]
+                    corner_node_id = f"N{corner_node_counter}"
+                    corner_node_counter += 1
                     
-                    try:
-                        path_skeleton_nodes = nx.shortest_path(skeleton_graph, s1, s2)
-                        
-                        # Check if path contains only degree-2 nodes between endpoints
-                        # (collapsing degree-2 chains)
-                        degrees = dict(skeleton_graph.degree())
-                        intermediate_are_degree2 = all(
-                            degrees.get(n, 0) == 2 
-                            for n in path_skeleton_nodes[1:-1]
-                        )
-                        
-                        # Also check if we cross another true node (shouldn't happen with clustering)
-                        crosses_other_node = False
-                        for n in path_skeleton_nodes[1:-1]:
-                            for other_node in nodes:
-                                if other_node['id'] != node1['id'] and other_node['id'] != node2['id']:
-                                    other_skeleton_nodes = true_node_to_skeleton_nodes.get(
-                                        int(other_node['id'][1:]) - 1, []
-                                    )
-                                    if n in other_skeleton_nodes:
-                                        crosses_other_node = True
-                                        break
-                            if crosses_other_node:
-                                break
-                        
-                        if not crosses_other_node:
-                            # Get initial path coordinates from skeleton (for topology only)
-                            path_coords_raw = [skeleton_graph.nodes[n]['xy'] for n in path_skeleton_nodes]
-                            
-                            # Refine centerline using polygon boundary (not raster coordinates)
-                            # Allow refinement to adjust ALL nodes to be equidistant from boundary
-                            try:
-                                # Refine entire path including endpoints
-                                refined_path = refine_centerline_with_boundary(
-                                    path_coords_raw,
-                                    polygon,
-                                    num_iterations=10,
-                                    final_iterations=3,
-                                    resample_length=10.0,
-                                    search_distance=10000.0,
-                                    um_per_px=um_per_px
-                                )
-                                path_coords = refined_path
-                            except Exception as e:
-                                logger.warning("Centerline refinement failed for edge %s-%s: %s, using skeleton coordinates",
-                                             node1['id'], node2['id'], e)
-                                path_coords = path_coords_raw
-                            
-                            break
-                    except nx.NetworkXNoPath:
-                        continue
-                    except Exception as e:
-                        logger.debug("Error finding path from %s to %s: %s", node1['id'], node2['id'], e)
-                        continue
-                if path_coords:
-                    break
-            
-            if path_coords and len(path_coords) >= 2:
-                # Check if edge already exists (ignore direction)
-                edge_key = tuple(sorted([node1['id'], node2['id']]))
-                if edge_key not in visited_edges:
+                    corner_node = {
+                        'id': corner_node_id,
+                        'xy': list(corner_xy),
+                        'kind': 'corner',
+                        'degree': 2,  # Topologically degree-2
+                        'cluster_nodes': []  # Corner nodes don't have skeleton cluster nodes
+                    }
+                    corner_nodes.append(corner_node)
+                    next_node_id = corner_node_id
+                
+                # Create edge segment
+                segment_coords = centerline_coords[corner_indices[i-1]:corner_indices[i]+1]
+                if len(segment_coords) >= 2:
                     edge_id = f"E{edge_counter}"
                     edge_counter += 1
                     
-                    # Update node positions to match refined centerline endpoints
-                    # This ensures nodes are equidistant from the polygon boundary
-                    if len(path_coords) >= 2:
-                        # Update node1 position to match refined centerline start
-                        node1['xy'] = list(path_coords[0])
-                        # Update node2 position to match refined centerline end
-                        node2['xy'] = list(path_coords[-1])
-                    
-                    edges.append({
+                    new_edges.append({
                         'id': edge_id,
-                        'u': node1['id'],
-                        'v': node2['id'],
+                        'u': prev_node_id,
+                        'v': next_node_id,
                         'centerline': {
                             'type': 'LineString',
-                            'coordinates': [[float(x), float(y)] for x, y in path_coords]
+                            'coordinates': [[float(x), float(y)] for x, y in segment_coords]
                         }
                     })
-                    visited_edges.add(edge_key)
+                
+                prev_node_id = next_node_id
     
+    # Add corner nodes to nodes list
+    nodes.extend(corner_nodes)
+    
+    # Update edge_counter
+    if new_edges:
+        max_edge_num = max(int(e['id'][1:]) for e in new_edges)
+        edge_counter = max_edge_num + 1
+    else:
+        edge_counter = 1
+    
+    edges = new_edges
     edge_build_time = time.time() - start
-    logger.info(f"  Built {len(edges)} edges (collapsing degree-2 chains) in {edge_build_time:.2f}s")
+    logger.info(f"  Built {len(edges)} edges from {len(terminals)} terminals (added {len(corner_nodes)} corner nodes) in {edge_build_time:.2f}s")
     
-    # D) Merge close junctions (extra junctions along trunk)
-    junction_merge_threshold = 3.0 * um_per_px  # 3 pixels in world units
+    # Export debug image: D_edges (after edge building)
+    if debug_output_dir:
+        try:
+            from .export_debug import export_debug_image
+            debug_path = os.path.join(debug_output_dir, "D_edges.png")
+            export_debug_image(
+                step_name="D_edges",
+                output_path=debug_path,
+                nodes=nodes,
+                edges=edges
+            )
+            logger.debug("Debug image saved: %s", debug_path)
+        except Exception as e:
+            logger.warning("Failed to export debug image D_edges: %s", e)
+    
+    # D'5: Graph-level merges - merge tiny junction-junction edges
+    # NOTE: Only merge "junction" nodes, never "corner" nodes
+    # Use threshold based on minimum_channel_width: 0.5-1.0 × minimum_channel_width
+    junction_merge_threshold = 0.75 * minimum_channel_width  # 0.75 × min channel width
     nodes_to_merge = []
     for i, node1 in enumerate(nodes):
         if node1['kind'] != 'junction':
             continue
         for node2 in nodes[i+1:]:
             if node2['kind'] != 'junction':
-                continue
+                continue  # Only merge junction-junction pairs, never corner nodes
             
             # Check if there's a direct edge between them
-            has_direct_edge = any(
-                (e['u'] == node1['id'] and e['v'] == node2['id']) or
-                (e['u'] == node2['id'] and e['v'] == node1['id'])
-                for e in edges
+            edge = next(
+                (e for e in edges if 
+                 (e['u'] == node1['id'] and e['v'] == node2['id']) or
+                 (e['u'] == node2['id'] and e['v'] == node1['id'])),
+                None
             )
             
-            if has_direct_edge:
-                # Check edge length
-                edge = next(
-                    (e for e in edges if 
-                     (e['u'] == node1['id'] and e['v'] == node2['id']) or
-                     (e['u'] == node2['id'] and e['v'] == node1['id'])),
-                    None
+            if edge:
+                # Compute edge length from centerline coordinates
+                coords = edge['centerline']['coordinates']
+                edge_length = sum(
+                    ((coords[j+1][0] - coords[j][0])**2 + 
+                     (coords[j+1][1] - coords[j][1])**2)**0.5
+                    for j in range(len(coords) - 1)
                 )
                 
-                if edge:
-                    coords = edge['centerline']['coordinates']
-                    edge_length = sum(
-                        ((coords[j+1][0] - coords[j][0])**2 + 
-                         (coords[j+1][1] - coords[j][1])**2)**0.5
-                        for j in range(len(coords) - 1)
-                    )
-                    
-                    if edge_length < junction_merge_threshold:
-                        nodes_to_merge.append((node1['id'], node2['id']))
+                if edge_length < junction_merge_threshold:
+                    nodes_to_merge.append((node1['id'], node2['id']))
     
     # Merge junctions (keep first, remove second, redirect edges)
     merged_node_ids = set()
@@ -1103,7 +1418,22 @@ def extract_graph_from_polygon(
         logger.debug("Merged junction %s into %s (edge length < %.1f µm)", node2_id, node1_id, junction_merge_threshold)
     
     if merged_node_ids:
-        logger.info(f"  Merged {len(merged_node_ids)} close junctions")
+        logger.info(f"  Merged {len(merged_node_ids)} close junctions (threshold: {junction_merge_threshold:.1f} µm)")
+    
+    # Export debug image: D_merged (after junction merging)
+    if debug_output_dir:
+        try:
+            from .export_debug import export_debug_image
+            debug_path = os.path.join(debug_output_dir, "D_merged.png")
+            export_debug_image(
+                step_name="D_merged",
+                output_path=debug_path,
+                nodes=nodes,
+                edges=edges
+            )
+            logger.debug("Debug image saved: %s", debug_path)
+        except Exception as e:
+            logger.warning("Failed to export debug image D_merged: %s", e)
     
     # D) Junction re-centering: fit best intersection point for symmetric branches
     # Note: This should happen AFTER centerline refinement but BEFORE measurement
@@ -1118,19 +1448,32 @@ def extract_graph_from_polygon(
         import time
         start = time.time()
         logger.info("Measuring edges (length and width profile)...")
-        for edge in edges:
+        measure_edge_total = 0.0
+        classify_total = 0.0
+        for i, edge in enumerate(edges, 1):
             centerline_coords = edge['centerline']['coordinates']
+            edge_start = time.time()
             try:
+                measure_start = time.time()
                 length, width_profile = measure_edge(
                     polygon,
                     centerline_coords,
                     width_sample_step=width_sample_step
                 )
+                measure_edge_time = time.time() - measure_start
+                measure_edge_total += measure_edge_time
+                
                 # Classify width profile
+                classify_start = time.time()
                 width_profile = classify_width_profile(width_profile)
+                classify_time = time.time() - classify_start
+                classify_total += classify_time
                 
                 edge['length'] = length
                 edge['width_profile'] = width_profile
+                
+                edge_time = time.time() - edge_start
+                logger.debug(f"  Edge {edge['id']} ({i}/{len(edges)}): measure={measure_edge_time:.2f}s, classify={classify_time:.2f}s, total={edge_time:.2f}s")
                 
             except Exception as e:
                 logger.warning("Failed to measure edge %s: %s", edge['id'], e)
@@ -1147,7 +1490,7 @@ def extract_graph_from_polygon(
                 }
         
         measure_time = time.time() - start
-        logger.info(f"  Measured {len(edges)} edges in {measure_time:.2f}s")
+        logger.info(f"  Measured {len(edges)} edges in {measure_time:.2f}s (measure_edge: {measure_edge_total:.2f}s, classify: {classify_total:.2f}s)")
         
         # 3. Graph-level pruning: delete leaf edges with length < L_min
         logger.debug("Graph-level pruning: removing short leaf edges")
@@ -1275,6 +1618,100 @@ def extract_graph_from_polygon(
             if node:
                 node['kind'] = 'endpoint'
                 logger.debug("Reclassified node %s from junction to endpoint (pitchfork removed)", node_id)
+        
+        # D'5: Remove degree-2 true nodes (standard network simplification)
+        # After all pruning, if any node ends up degree 2, remove it and concatenate its two incident edges
+        # NOTE: Do not delete "corner" nodes; only delete degree-2 nodes of kind "internal" if any remain
+        logger.debug("D'5: Removing degree-2 true nodes and concatenating edges (excluding corner nodes)")
+        
+        # Compute node degrees
+        node_degrees = {}
+        node_edges_map = {}  # node_id -> list of edges
+        for edge in edges:
+            node_degrees[edge['u']] = node_degrees.get(edge['u'], 0) + 1
+            node_degrees[edge['v']] = node_degrees.get(edge['v'], 0) + 1
+            if edge['u'] not in node_edges_map:
+                node_edges_map[edge['u']] = []
+            if edge['v'] not in node_edges_map:
+                node_edges_map[edge['v']] = []
+            node_edges_map[edge['u']].append(edge)
+            node_edges_map[edge['v']].append(edge)
+        
+        # Find degree-2 nodes (excluding endpoints and corners which should stay)
+        nodes_to_remove_degree2 = []
+        for node in nodes:
+            node_id = node['id']
+            degree = node_degrees.get(node_id, 0)
+            # Remove degree-2 nodes (but not endpoints or corners, as they should remain)
+            if degree == 2 and node['kind'] not in ('endpoint', 'corner'):
+                incident_edges = node_edges_map.get(node_id, [])
+                if len(incident_edges) == 2:
+                    nodes_to_remove_degree2.append((node_id, incident_edges))
+        
+        # Remove degree-2 nodes and concatenate their edges
+        removed_degree2_count = 0
+        for node_id, incident_edges in nodes_to_remove_degree2:
+            if len(incident_edges) != 2:
+                continue
+            
+            edge1, edge2 = incident_edges
+            
+            # Determine which endpoints of each edge connect to this node
+            # Find the other endpoint of each edge
+            if edge1['u'] == node_id:
+                other_node1_id = edge1['v']
+                coords1_reversed = False
+            else:
+                other_node1_id = edge1['u']
+                coords1_reversed = True
+            
+            if edge2['u'] == node_id:
+                other_node2_id = edge2['v']
+                coords2_reversed = False
+            else:
+                other_node2_id = edge2['u']
+                coords2_reversed = True
+            
+            # Concatenate centerlines
+            coords1 = list(edge1['centerline']['coordinates'])
+            coords2 = list(edge2['centerline']['coordinates'])
+            
+            if coords1_reversed:
+                coords1 = coords1[::-1]
+            if coords2_reversed:
+                coords2 = coords2[::-1]
+            
+            # Merge: coords1 ends at node, coords2 starts at node
+            # Remove duplicate middle point (the node)
+            concatenated_coords = coords1[:-1] + coords2
+            
+            # Create new edge connecting the two other nodes
+            new_edge_id = f"E{edge_counter}"
+            edge_counter += 1
+            
+            new_edge = {
+                'id': new_edge_id,
+                'u': other_node1_id,
+                'v': other_node2_id,
+                'centerline': {
+                    'type': 'LineString',
+                    'coordinates': [[float(x), float(y)] for x, y in concatenated_coords]
+                }
+            }
+            
+            # Remove old edges and add new one
+            edges = [e for e in edges if e['id'] not in (edge1['id'], edge2['id'])]
+            edges.append(new_edge)
+            
+            # Remove the degree-2 node
+            nodes = [n for n in nodes if n['id'] != node_id]
+            removed_degree2_count += 1
+            
+            logger.debug("Removed degree-2 node %s, concatenated edges %s and %s into %s", 
+                        node_id, edge1['id'], edge2['id'], new_edge_id)
+        
+        if removed_degree2_count > 0:
+            logger.info(f"  Removed {removed_degree2_count} degree-2 nodes and concatenated edges")
     
     # Final pass: reclassify degree-1 nodes as endpoints and snap ALL endpoints to boundary
     logger.debug("Final pass: reclassifying degree-1 nodes as endpoints and snapping to boundary")
@@ -1312,7 +1749,7 @@ def extract_graph_from_polygon(
             snapped_xy = snap_endpoint_to_boundary(
                 endpoint_xy,
                 polygon,
-                skeleton_graph,
+                contracted_graph,  # Use contracted graph
                 endpoint_node_id,
                 incident_edge_coords=incident_edge_coords
             )
@@ -1361,14 +1798,30 @@ def extract_graph_from_polygon(
     
     logger.info(f"Graph built: {len(nodes)} nodes, {len(edges)} edges in {node_build_time + edge_build_time:.2f}s total")
     
+    # Export debug image: D_final (final graph)
+    if debug_output_dir:
+        try:
+            from .export_debug import export_debug_image
+            debug_path = os.path.join(debug_output_dir, "D_final.png")
+            export_debug_image(
+                step_name="D_final",
+                output_path=debug_path,
+                nodes=nodes,
+                edges=edges
+            )
+            logger.debug("Debug image saved: %s", debug_path)
+        except Exception as e:
+            logger.warning("Failed to export debug image D_final: %s", e)
+    
     result = {
         'nodes': nodes,
         'edges': edges,
-        'skeleton_graph': skeleton_graph,  # For debugging/visualization
-        # C2 data: skeleton graph after endpoint merging
+        'skeleton_graph': skeleton_graph,  # Original skeleton graph for debugging/visualization
+        # C2 data: skeleton graph after endpoint merging and cluster contraction
         'c2_data': {
-            'skeleton_graph': skeleton_graph,  # Skeleton graph after endpoint merging
-            'junction_clusters': junction_clusters,
+            'skeleton_graph': skeleton_graph,  # Original skeleton graph
+            'contracted_graph': contracted_graph,  # Graph after cluster contraction (D'2, D'3)
+            'junction_clusters': junction_clusters,  # Final junction clusters (after contraction)
             'endpoint_clusters': endpoint_clusters,
             'forbidden_nodes': forbidden_nodes,
             'polygon': polygon
@@ -1383,7 +1836,7 @@ def extract_graph_from_polygons(
     minimum_channel_width: float,
     um_per_px: Optional[float] = None,
     simplify_tolerance: Optional[float] = None,
-    width_sample_step: float = 10.0,
+    width_sample_step: Optional[float] = None,
     measure_edges: bool = True,
     circles: Optional[List[Dict[str, Any]]] = None,
     port_snap_distance: float = 50.0,
@@ -1393,7 +1846,8 @@ def extract_graph_from_polygons(
     default_cross_section_kind: str = "rectangular",
     per_edge_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     simplify_tolerance_factor: float = 0.5,
-    endpoint_merge_distance_factor: float = 1.0
+    endpoint_merge_distance_factor: float = 1.0,
+    debug_output_dir: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Extract network graph from multiple polygons (union first) and optionally detect ports.
@@ -1404,7 +1858,7 @@ def extract_graph_from_polygons(
                               Used to calculate um_per_px = ceil(minimum_channel_width / 10) if um_per_px not provided.
         um_per_px: Resolution for skeletonization (microns per pixel). If None, calculated as ceil(minimum_channel_width / 10).
         simplify_tolerance: Tolerance for path simplification. If None, computed as simplify_tolerance_factor * minimum_channel_width.
-        width_sample_step: Distance between width samples along centerline (default: 10.0)
+        width_sample_step: Distance between width samples along centerline (default: None, computed as minimum_channel_width / 3)
         measure_edges: If True, measure length and width profile for each edge (default: True)
         circles: Optional list of circle dicts from DXF loader for port detection
         port_snap_distance: Maximum distance to attach port to node (default: 50.0 µm)
@@ -1425,6 +1879,12 @@ def extract_graph_from_polygons(
     if um_per_px is None:
         um_per_px = math.ceil(minimum_channel_width / 10.0)
         logger.info(f"Calculated um_per_px={um_per_px:.2f} from minimum_channel_width={minimum_channel_width:.2f} µm")
+    
+    # Compute width_sample_step from minimum_channel_width if not provided
+    if width_sample_step is None:
+        width_sample_step = minimum_channel_width / 3.0
+        logger.info(f"Computed width_sample_step={width_sample_step:.1f} µm from minimum_channel_width={minimum_channel_width:.1f} µm")
+    
     from shapely.geometry import Polygon
     from shapely.ops import unary_union
     
@@ -1469,7 +1929,8 @@ def extract_graph_from_polygons(
         default_cross_section_kind=default_cross_section_kind,
         per_edge_overrides=per_edge_overrides,
         simplify_tolerance_factor=simplify_tolerance_factor,
-        endpoint_merge_distance_factor=endpoint_merge_distance_factor
+        endpoint_merge_distance_factor=endpoint_merge_distance_factor,
+        debug_output_dir=debug_output_dir
     )
     
     # Optionally detect ports

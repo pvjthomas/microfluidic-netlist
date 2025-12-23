@@ -833,6 +833,7 @@ class PipelineVisualizer:
             skeleton_graph_raw, transform = skeletonize_polygon(
                 combined_poly,
                 um_per_px=um_per_px,
+                L_spur_cutoff=minimum_channel_width,
                 simplify_tolerance=None  # Don't simplify yet, we'll do it in vector conversion
             )
             t1 = time.time()

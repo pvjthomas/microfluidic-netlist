@@ -45,4 +45,5 @@ Thumbs.db
 *.dxf
 temp_workspaces/
 .mplconfig/
+examples/
 
