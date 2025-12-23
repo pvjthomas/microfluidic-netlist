@@ -990,7 +990,8 @@ def extract_graph_from_polygon(
     per_edge_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     simplify_tolerance_factor: float = 0.5,
     endpoint_merge_distance_factor: float = 1.0,
-    debug_output_dir: Optional[str] = None
+    debug_output_dir: Optional[str] = None,
+    L_spur_cutoff: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Extract network graph from a polygon.
@@ -1022,10 +1023,13 @@ def extract_graph_from_polygon(
     
     # Skeletonize polygon
     logger.info("Building graph from skeleton")
+    # Use L_spur_cutoff if provided, otherwise default to minimum_channel_width
+    if L_spur_cutoff is None:
+        L_spur_cutoff = minimum_channel_width
     skeleton_graph, transform = skeletonize_polygon(
         polygon,
         um_per_px=um_per_px,
-        L_spur_cutoff=minimum_channel_width,
+        L_spur_cutoff=L_spur_cutoff,
         simplify_tolerance=simplify_tolerance
     )
     
@@ -1847,7 +1851,8 @@ def extract_graph_from_polygons(
     per_edge_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     simplify_tolerance_factor: float = 0.5,
     endpoint_merge_distance_factor: float = 1.0,
-    debug_output_dir: Optional[str] = None
+    debug_output_dir: Optional[str] = None,
+    L_spur_cutoff: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Extract network graph from multiple polygons (union first) and optionally detect ports.
@@ -1930,7 +1935,8 @@ def extract_graph_from_polygons(
         per_edge_overrides=per_edge_overrides,
         simplify_tolerance_factor=simplify_tolerance_factor,
         endpoint_merge_distance_factor=endpoint_merge_distance_factor,
-        debug_output_dir=debug_output_dir
+        debug_output_dir=debug_output_dir,
+        L_spur_cutoff=L_spur_cutoff
     )
     
     # Optionally detect ports

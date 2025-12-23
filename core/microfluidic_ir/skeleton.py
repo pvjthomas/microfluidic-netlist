@@ -569,6 +569,18 @@ def skeletonize_polygon(
                 logger.debug("skeletonize_polygon: medial_axis output shape: %s, dtype: %s",
                             algo_img.shape, algo_img.dtype)
                 
+                # Make it 1px-wide and break many 2x2 artifacts
+                logger.debug("skeletonize_polygon: applying thin() to medial_axis result")
+                try:
+                    skel = thin(algo_img)
+                    algo_img = skel
+                    skeleton_pixels_count_after_thin = int(np.sum(algo_img))
+                    logger.info("skeletonize_polygon: after thin(), skeleton has %d pixels (was %d)",
+                               skeleton_pixels_count_after_thin, skeleton_pixels_count)
+                except Exception as e:
+                    logger.warning("skeletonize_polygon: thin() failed on medial_axis result: %s", e)
+                    # Continue with original medial_axis result
+                
                 skeleton_img = algo_img
                 skeleton_time = algo_time
                 algo_name = 'medial_axis'
@@ -747,6 +759,12 @@ def skeletonize_polygon(
                 for dc in [-1, 0, 1]:
                     if dr == 0 and dc == 0:
                         continue
+                    
+                    # If diagonal neighbor, skip it when it would create a triangle via orthogonal pixels
+                    if abs(dr) == 1 and abs(dc) == 1:
+                        if (row + dr, col) in pixel_to_node or (row, col + dc) in pixel_to_node:
+                            continue
+                    
                     neighbor = (row + dr, col + dc)
                     if neighbor in pixel_to_node:
                         neighbor_id = pixel_to_node[neighbor]

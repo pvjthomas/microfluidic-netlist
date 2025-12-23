@@ -13,6 +13,53 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
+def load_pipeline_parameters(dxf_path: str) -> Dict[str, Any]:
+    """
+    Load pipeline parameters from FILENAME_param.txt file if it exists.
+    
+    Args:
+        dxf_path: Path to DXF file
+        
+    Returns:
+        Dictionary of parameter name -> value. Only includes parameters that were found in the file.
+    """
+    params = {}
+    dxf_file_path = Path(dxf_path)
+    param_file_path = dxf_file_path.parent / f"{dxf_file_path.stem}_param.txt"
+    
+    if not param_file_path.exists():
+        logger.debug(f"Parameter file not found: {param_file_path}")
+        return params
+    
+    logger.info(f"Loading parameters from: {param_file_path}")
+    try:
+        with open(param_file_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Parse "parameter_name = value" format
+                if '=' in line:
+                    parts = line.split('=', 1)
+                    param_name = parts[0].strip()
+                    param_value_str = parts[1].strip()
+                    
+                    try:
+                        # Try to evaluate as Python expression (handles 1e2, etc.)
+                        param_value = eval(param_value_str)
+                        params[param_name] = param_value
+                        logger.debug(f"  Loaded {param_name} = {param_value}")
+                    except Exception as e:
+                        logger.warning(f"  Failed to parse parameter on line {line_num}: {line} ({e})")
+                        continue
+    except Exception as e:
+        logger.warning(f"Failed to load parameter file {param_file_path}: {e}")
+    
+    return params
+
+
 def build_channel_regions(polygons: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Build channel regions by subtracting contained polygons from their containers.
@@ -216,7 +263,8 @@ def run_pipeline(
     enable_step_a: bool = True,
     enable_step_b: bool = True,
     enable_step_c: bool = True,
-    enable_step_d: bool = True
+    enable_step_d: bool = True,
+    L_spur_cutoff: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Run the full pipeline: DXF load → channel selection → graph extraction.
@@ -245,6 +293,10 @@ def run_pipeline(
         enable_step_b: If True, run Step B (channel selection) (default: True)
         enable_step_c: If True, allow Step C (skeleton extraction) (default: True)
         enable_step_d: If True, allow Step D (graph extraction) (default: True)
+        L_spur_cutoff: Maximum length in microns for spur pruning. Spurs shorter than
+                      this that end at junctions (degree >= 3) will be removed.
+                      If None, defaults to minimum_channel_width. Can also be set via
+                      FILENAME_param.txt file.
     
     Returns:
         Dictionary with:
@@ -263,6 +315,21 @@ def run_pipeline(
     
     # Place log file in the same directory as the DXF file
     log_file_path = dxf_file_path.parent / log_filename
+    
+    # Load parameters from param file if it exists
+    param_file_params = load_pipeline_parameters(dxf_path)
+    
+    # Override parameters with values from param file if they exist
+    if 'minimum_channel_width' in param_file_params:
+        minimum_channel_width = param_file_params['minimum_channel_width']
+        logger.info(f"Using minimum_channel_width from param file: {minimum_channel_width} µm")
+    
+    if 'L_spur_cutoff' in param_file_params:
+        L_spur_cutoff = param_file_params['L_spur_cutoff']
+        logger.info(f"Using L_spur_cutoff from param file: {L_spur_cutoff} µm")
+    elif L_spur_cutoff is None:
+        # Default to minimum_channel_width if not specified
+        L_spur_cutoff = minimum_channel_width
     
     # Compute width_sample_step from minimum_channel_width if not provided
     if width_sample_step is None:
@@ -367,7 +434,7 @@ def run_pipeline(
         um_per_px_from_size = math.ceil(padded_max_dim / max_dimension)
         
         # Use the maximum of both to ensure we meet both constraints
-        um_per_px_proposed = max(um_per_px_from_width, um_per_px_from_size)
+        um_per_px_proposed = max(um_per_px_max, um_per_px_from_size)
         
         # Enforce hard maximum: um_per_px must not exceed um_per_px_max
         if um_per_px_proposed > um_per_px_max:
@@ -438,7 +505,8 @@ def run_pipeline(
                 per_edge_overrides=per_edge_overrides,
                 simplify_tolerance_factor=simplify_tolerance_factor,
                 endpoint_merge_distance_factor=endpoint_merge_distance_factor,
-                debug_output_dir=debug_output_dir
+                debug_output_dir=debug_output_dir,
+                L_spur_cutoff=L_spur_cutoff
             )
             step_cd_time = time.time() - step_cd_start
             logger.info(f"Steps C & D: Completed in {step_cd_time:.2f}s")
