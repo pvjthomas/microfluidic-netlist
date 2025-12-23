@@ -1102,7 +1102,8 @@ def extract_graph_from_polygon(
                 skeleton_graph=skeleton_graph,
                 contracted_graph=contracted_graph,
                 junction_clusters=junction_clusters_raw,
-                cluster_rep_map=cluster_rep_map
+                cluster_rep_map=cluster_rep_map,
+                polygon=polygon  # Pass the Shapely polygon
             )
             logger.debug("Debug image saved: %s", debug_path)
         except Exception as e:

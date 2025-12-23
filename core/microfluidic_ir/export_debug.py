@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 def compute_bounds_from_geometry(
     polygons: Optional[List[Dict[str, Any]]] = None,
+    polygon: Optional[Polygon] = None,  # Shapely polygon
     skeleton_graph: Optional[nx.Graph] = None,
     nodes: Optional[List[Dict[str, Any]]] = None,
     edges: Optional[List[Dict[str, Any]]] = None,
@@ -27,7 +28,20 @@ def compute_bounds_from_geometry(
     all_x = []
     all_y = []
     
-    # Collect points from polygons
+    # Collect points from Shapely polygon
+    if polygon is not None:
+        # Get exterior ring
+        exterior_coords = list(polygon.exterior.coords)
+        for coord in exterior_coords:
+            all_x.append(coord[0])
+            all_y.append(coord[1])
+        # Get interior rings (holes)
+        for interior in polygon.interiors:
+            for coord in interior.coords:
+                all_x.append(coord[0])
+                all_y.append(coord[1])
+    
+    # Collect points from polygons (dict format)
     if polygons:
         for poly_data in polygons:
             coords = poly_data['polygon']['coordinates'][0]
@@ -101,6 +115,7 @@ def export_debug_image(
     step_name: str,
     output_path: str,
     polygons: Optional[List[Dict[str, Any]]] = None,
+    polygon: Optional[Polygon] = None,  # Shapely polygon
     skeleton_graph: Optional[nx.Graph] = None,
     contracted_graph: Optional[nx.Graph] = None,
     junction_clusters: Optional[Dict[int, List[int]]] = None,
@@ -118,6 +133,7 @@ def export_debug_image(
         step_name: Name of the step (e.g., "C_skeleton", "C2_contracted", "D_nodes", "D_edges")
         output_path: Output file path
         polygons: Optional list of polygon dicts
+        polygon: Optional Shapely polygon (with holes)
         skeleton_graph: Optional skeleton graph
         contracted_graph: Optional contracted skeleton graph
         junction_clusters: Optional dict mapping cluster_id to list of node IDs
@@ -136,6 +152,7 @@ def export_debug_image(
     # Compute bounds with extra padding for debug images
     xmin, ymin, xmax, ymax = compute_bounds_from_geometry(
         polygons=polygons,
+        polygon=polygon,
         skeleton_graph=active_graph,
         nodes=nodes,
         edges=edges,
@@ -144,8 +161,8 @@ def export_debug_image(
     width_um = xmax - xmin
     height_um = ymax - ymin
     
-    # Add additional buffer for markers and text (estimate ~1000µm margin)
-    buffer_um = 1000.0
+    # Add additional whitespace buffer around the image (increased for better visibility)
+    buffer_um = 2000.0  # Increased from 1000.0 to add more whitespace
     width_um += 2 * buffer_um
     height_um += 2 * buffer_um
     xmin -= buffer_um
@@ -181,7 +198,32 @@ def export_debug_image(
         except:
             font = ImageFont.load_default()
     
-    # Draw polygons (if provided)
+    # Draw Shapely polygon with holes (if provided)
+    if polygon is not None:
+        # Draw exterior ring with fill
+        exterior_coords = list(polygon.exterior.coords)
+        if len(exterior_coords) >= 3:
+            # Exclude last duplicate coordinate (Shapely polygons close the ring)
+            img_coords_exterior = [
+                clamp_coord(*world_to_image(coord[0], coord[1], xmin, ymin, um_per_px), image_width, image_height)
+                for coord in exterior_coords[:-1]
+            ]
+            # Draw exterior polygon with fill
+            draw.polygon(img_coords_exterior, fill=(240, 240, 255), outline=(200, 200, 220))
+        
+        # Draw interior rings (holes) by filling them with background color to create voids
+        for interior in polygon.interiors:
+            interior_coords = list(interior.coords)
+            if len(interior_coords) >= 3:
+                # Exclude last duplicate coordinate
+                img_coords_interior = [
+                    clamp_coord(*world_to_image(coord[0], coord[1], xmin, ymin, um_per_px), image_width, image_height)
+                    for coord in interior_coords[:-1]
+                ]
+                # Draw hole in white (background color) to create void
+                draw.polygon(img_coords_interior, fill=(255, 255, 255), outline=(200, 200, 220))
+    
+    # Draw polygons (if provided) - dict format
     if polygons:
         for poly_data in polygons:
             coords = poly_data['polygon']['coordinates'][0]
@@ -231,6 +273,18 @@ def export_debug_image(
                     # Draw in green for endpoints
                     if bbox[2] > bbox[0] and bbox[3] > bbox[1]:  # Valid bbox
                         draw.ellipse(bbox, fill=(100, 255, 100), outline=(0, 200, 0))
+    
+    # Draw endpoints (degree-1 nodes) from contracted_graph for C2_contracted
+    if step_name == "C2_contracted" and contracted_graph:
+        endpoint_nodes = [n for n in contracted_graph.nodes() if contracted_graph.degree(n) == 1]
+        for node_id in endpoint_nodes:
+            xy = contracted_graph.nodes[node_id]['xy']
+            x, y = clamp_coord(*world_to_image(xy[0], xy[1], xmin, ymin, um_per_px), image_width, image_height)
+            radius = max(12, int(20 / um_per_px))  # Larger radius for visibility
+            bbox = clamp_bbox([x - radius, y - radius, x + radius, y + radius], image_width, image_height, outline_width=2)
+            # Draw in green for endpoints
+            if bbox[2] > bbox[0] and bbox[3] > bbox[1]:  # Valid bbox
+                draw.ellipse(bbox, fill=(100, 255, 100), outline=(0, 200, 0), width=2)
     
     # Draw cluster representatives (if cluster_rep_map provided) - 4x larger markers
     if cluster_rep_map and graph_to_draw:
