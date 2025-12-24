@@ -905,7 +905,7 @@ def skeletonize_polygon(
     log_msg += ")"
     logger.info(log_msg)
     
-    # Save skeleton image after pruning
+    # Save skeleton image after pruning (color-coded to match clustercontraction scheme)
     try:
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -913,9 +913,13 @@ def skeletonize_polygon(
         output_dir.mkdir(exist_ok=True)
         output_path = output_dir / f"skeleton_after_pruning_{timestamp}.png"
         
-        # Reconstruct skeleton image from remaining graph nodes
+        # Reconstruct skeleton image from remaining graph nodes with color-coding
         # Use the same dimensions as the original skeleton_img
-        skeleton_img_after = np.zeros_like(skeleton_img, dtype=bool)
+        img_height, img_width = skeleton_img.shape
+        skeleton_img_after = np.zeros((img_height, img_width, 3), dtype=np.uint8)
+        
+        # Get node degrees for color-coding
+        node_degrees = dict(G.degree())
         
         # Convert each remaining node's coordinates back to pixel coordinates
         for node_id in G.nodes():
@@ -925,15 +929,23 @@ def skeletonize_polygon(
             # corresponds to max_y in coordinates. We need to invert the row.
             row, col = coords_to_pixel(x, y, transform)
             # Invert row to match the flipped image coordinate system
-            img_height = skeleton_img.shape[0]
             inverted_row = img_height - 1 - row
             
-            # Check bounds and set pixel
-            if 0 <= inverted_row < skeleton_img.shape[0] and 0 <= col < skeleton_img.shape[1]:
-                skeleton_img_after[inverted_row, col] = True
+            # Check bounds
+            if 0 <= inverted_row < img_height and 0 <= col < img_width:
+                # Color-code based on node degree (matching export_colored_skeleton_pixels scheme)
+                degree = node_degrees.get(node_id, 0)
+                if degree == 1:
+                    color = (100, 255, 100)  # Green for endpoints
+                elif degree >= 3:
+                    color = (255, 100, 100)  # Red for junctions
+                else:  # degree == 2
+                    color = (200, 200, 255)  # Light blue for intermediate nodes
+                
+                skeleton_img_after[inverted_row, col] = color
         
-        # Convert boolean array to uint8 for saving (0=black, 255=white)
-        img_to_save = Image.fromarray((skeleton_img_after.astype(np.uint8) * 255), mode='L')
+        # Convert RGB array to PIL Image and save
+        img_to_save = Image.fromarray(skeleton_img_after, mode='RGB')
         img_to_save.save(output_path)
         logger.info(f"Saved skeleton after pruning to {output_path}")
     except Exception as e:
@@ -1818,18 +1830,35 @@ def contract_junction_clusters(
     contracted = skeleton_graph.copy()
     cluster_rep_map = {}  # Maps original node_id -> rep node_id
     
+    # Compute degrees before contraction to identify endpoints
+    degrees_before = dict(skeleton_graph.degree())
+    endpoint_nodes_before = {n for n in skeleton_graph.nodes() if degrees_before.get(n, 0) == 1}
+    
     # Find valid clusters (arms >= min_arms) and their representatives
     valid_clusters = {}
     for cluster_id, cluster_nodes in junction_clusters.items():
-        num_arms = validate_junction_cluster_arms(skeleton_graph, cluster_nodes)
+        # Exclude endpoints (degree-1 nodes) from junction clusters
+        # Endpoints should never be part of junction clusters
+        cluster_nodes_filtered = [n for n in cluster_nodes if degrees_before.get(n, 0) != 1]
+        
+        if not cluster_nodes_filtered:
+            logger.debug("Junction cluster %d: all nodes are endpoints, skipping", cluster_id)
+            continue
+        
+        # If some nodes were filtered, log it
+        if len(cluster_nodes_filtered) < len(cluster_nodes):
+            logger.debug("Junction cluster %d: filtered out %d endpoint nodes", 
+                        cluster_id, len(cluster_nodes) - len(cluster_nodes_filtered))
+        
+        num_arms = validate_junction_cluster_arms(skeleton_graph, cluster_nodes_filtered)
         if num_arms >= min_arms:
-            rep_node = find_cluster_representative(skeleton_graph, cluster_nodes)
-            valid_clusters[cluster_id] = (cluster_nodes, rep_node)
+            rep_node = find_cluster_representative(skeleton_graph, cluster_nodes_filtered)
+            valid_clusters[cluster_id] = (cluster_nodes_filtered, rep_node)
             logger.debug("Junction cluster %d: %d nodes, %d arms, rep=%d", 
-                        cluster_id, len(cluster_nodes), num_arms, rep_node)
+                        cluster_id, len(cluster_nodes_filtered), num_arms, rep_node)
         else:
             logger.debug("Junction cluster %d: %d nodes, %d arms (rejected, < %d arms)", 
-                        cluster_id, len(cluster_nodes), num_arms, min_arms)
+                        cluster_id, len(cluster_nodes_filtered), num_arms, min_arms)
     
     # Contract each valid cluster
     for cluster_id, (cluster_nodes, rep_node) in valid_clusters.items():
@@ -1887,24 +1916,28 @@ def contract_junction_clusters(
             if arm_nodes:
                 arms.append(arm_nodes)
         
-        # Step 3: For each arm, choose representative (smallest node ID)
+        # Step 3: For each arm, choose representative (prefer boundary nodes, smallest node ID)
         arm_reps = {}  # Maps arm_index -> representative node_id
         for arm_idx, arm_nodes in enumerate(arms):
-            # Choose node with smallest node ID
-            arm_rep = min(arm_nodes)
+            # Prefer nodes that are on the boundary (intersection with external_neighbors)
+            arm_boundary = arm_nodes.intersection(external_neighbors)
+            arm_rep = min(arm_boundary) if arm_boundary else min(arm_nodes)
             arm_reps[arm_idx] = arm_rep
         
         # Step 4: Connect rep_node to each arm representative exactly once
         # and copy edge attributes from shortest existing edge
         for arm_idx, arm_rep in arm_reps.items():
             arm_nodes = arms[arm_idx]
+            # Only consider edges from cluster nodes to arm boundary nodes (true attachment points)
+            arm_boundary = arm_nodes.intersection(external_neighbors)
+            candidates = arm_boundary if arm_boundary else arm_nodes
             
-            # Find shortest edge from any cluster node to any node in this arm
+            # Find shortest edge from any cluster node to any boundary node in this arm
             shortest_edge_data = None
             shortest_length = float('inf')
             
             for cluster_node in sorted(cluster_nodes):  # Sort for determinism
-                for arm_node in sorted(arm_nodes):  # Sort for determinism
+                for arm_node in sorted(candidates):  # Sort for determinism
                     if contracted.has_edge(cluster_node, arm_node):
                         # Get edge length (weight or compute from coordinates)
                         edge_data = dict(contracted.edges[cluster_node, arm_node])
@@ -2046,6 +2079,9 @@ def merge_close_endpoints(
     if len(endpoint_nodes) < 2:
         return {i: [n] for i, n in enumerate(endpoint_nodes)}
     
+    # Sort endpoint_nodes for deterministic iteration
+    endpoint_nodes = sorted(endpoint_nodes)
+    
     if forbidden_nodes is None:
         forbidden_nodes = set()
     
@@ -2069,8 +2105,8 @@ def merge_close_endpoints(
                 continue
             forbidden_xy = skeleton_graph.nodes[forbidden_node]['xy']
             forbidden_point = Point(forbidden_xy)
-            # Add all nodes within 2 px to forbidden set
-            for node_id in skeleton_graph.nodes():
+            # Add all nodes within 2 px to forbidden set (iterate in sorted order for determinism)
+            for node_id in sorted(skeleton_graph.nodes()):
                 if node_id in forbidden_with_guard:
                     continue
                 node_xy = skeleton_graph.nodes[node_id]['xy']
@@ -2083,6 +2119,7 @@ def merge_close_endpoints(
     used = set()
     cluster_id = 0
     
+    # Iterate endpoints in sorted order (endpoint_nodes is already sorted)
     for i, node1 in enumerate(endpoint_nodes):
         if node1 in used:
             continue
@@ -2099,7 +2136,8 @@ def merge_close_endpoints(
         used.add(node1)
         
         # Find all topologically close endpoints using BFS
-        for j, node2 in enumerate(endpoint_nodes[i+1:], start=i+1):
+        # Iterate remaining candidates in sorted order for determinism
+        for node2 in sorted(endpoint_nodes[i+1:]):
             if node2 in used:
                 continue
             
@@ -2142,10 +2180,23 @@ def merge_close_endpoints(
                 cluster.append(node2)
                 used.add(node2)
         
+        # Sort node IDs in cluster for determinism
+        cluster = sorted(cluster)
         merged[cluster_id] = cluster
         cluster_id += 1
     
-    logger.debug("merge_close_endpoints: merged %d endpoints into %d clusters (topology-aware)",
-                len(endpoint_nodes), len(merged))
+    # Make cluster IDs deterministic: sort clusters by smallest node ID
+    # Create list of (min_node_id, cluster_id, cluster_nodes) tuples
+    cluster_tuples = [(min(nodes), cid, nodes) for cid, nodes in merged.items()]
+    # Sort by minimum node ID
+    cluster_tuples.sort(key=lambda x: x[0])
     
-    return merged
+    # Rebuild merged dict with deterministic cluster IDs (0, 1, 2, ...)
+    merged_deterministic = {}
+    for new_cluster_id, (_, old_cluster_id, nodes) in enumerate(cluster_tuples):
+        merged_deterministic[new_cluster_id] = nodes
+    
+    logger.debug("merge_close_endpoints: merged %d endpoints into %d clusters (topology-aware)",
+                len(endpoint_nodes), len(merged_deterministic))
+    
+    return merged_deterministic

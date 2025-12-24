@@ -1104,6 +1104,16 @@ def extract_graph_from_polygon(
             # All nodes in cluster map to same rep
             junction_clusters[cluster_id] = [rep_node]
     
+    # Validate and log node classification after contraction
+    # This helps identify if endpoints are being lost during contraction
+    degrees_contracted = dict(contracted_graph.degree())
+    endpoint_nodes_after_contraction = [n for n in contracted_graph.nodes() if degrees_contracted.get(n, 0) == 1]
+    junction_nodes_after_contraction = [n for n in contracted_graph.nodes() if degrees_contracted.get(n, 0) >= 3]
+    degree2_nodes_after_contraction = [n for n in contracted_graph.nodes() if degrees_contracted.get(n, 0) == 2]
+    logger.info(f"After contraction: {len(endpoint_nodes_after_contraction)} endpoints (degree=1), "
+                f"{len(junction_nodes_after_contraction)} junctions (degree>=3), "
+                f"{len(degree2_nodes_after_contraction)} intermediate (degree=2) in contracted graph")
+    
     # Export debug image: C2_contracted (after cluster contraction)
     if debug_output_dir:
         try:
@@ -1180,10 +1190,23 @@ def extract_graph_from_polygon(
     skeleton_node_to_true_node = {}
     
     # Add junction clusters (now just single rep nodes)
+    # Classify nodes based on actual degree in contracted graph
     for cluster_id, cluster_nodes in junction_clusters.items():
         # cluster_nodes now contains just the rep node after contraction
         rep_node = cluster_nodes[0]
         xy = list(contracted_graph.nodes[rep_node]['xy'])
+        actual_degree = degrees_contracted.get(rep_node, 0)
+        
+        # Classify based on actual degree: degree 1 = endpoint, degree >= 3 = junction
+        if actual_degree == 1:
+            node_kind = 'endpoint'
+        elif actual_degree >= 3:
+            node_kind = 'junction'
+        else:
+            # Degree 2 or other - keep as junction for now (shouldn't happen for junction clusters)
+            node_kind = 'junction'
+            logger.warning(f"Junction cluster rep node {rep_node} has degree {actual_degree}, expected >= 3")
+        
         node_id = f"N{node_counter}"
         true_node_idx = node_counter - 1  # 0-indexed position in nodes list
         node_counter += 1
@@ -1194,21 +1217,26 @@ def extract_graph_from_polygon(
         nodes.append({
             'id': node_id,
             'xy': xy,
-            'kind': 'junction',
-            'degree': contracted_graph.degree(rep_node),  # Degree in contracted graph
+            'kind': node_kind,  # Classified based on actual degree
+            'degree': actual_degree,
             'cluster_nodes': cluster_nodes  # Store for reference
         })
     
     # Add endpoint clusters
+    # Classify nodes based on actual degree in contracted graph
     for cluster_id, cluster_nodes in endpoint_clusters.items():
+        # Get representative node (prefer degree-1 node if available)
+        rep_node = next((n for n in cluster_nodes if degrees_contracted.get(n, 0) == 1), cluster_nodes[0])
+        actual_degree = degrees_contracted.get(rep_node, 0)
+        
         if len(cluster_nodes) == 1:
             centroid = contracted_graph.nodes[cluster_nodes[0]]['xy']
             endpoint_node_id = cluster_nodes[0]
         else:
             # Use centroid of merged endpoints
             centroid = compute_cluster_centroid(contracted_graph, cluster_nodes)
-            # Use the first node for direction finding
-            endpoint_node_id = cluster_nodes[0]
+            # Use the rep node for direction finding
+            endpoint_node_id = rep_node
         
         # Snap endpoint to polygon boundary (initial snap, will be refined later)
         # At this stage we don't have edge coordinates yet, so use skeleton direction
@@ -1219,6 +1247,17 @@ def extract_graph_from_polygon(
             endpoint_node_id,
             incident_edge_coords=None
         )
+        
+        # Classify based on actual degree: degree 1 = endpoint, degree >= 3 = junction
+        if actual_degree == 1:
+            node_kind = 'endpoint'
+        elif actual_degree >= 3:
+            node_kind = 'junction'
+            logger.warning(f"Endpoint cluster rep node {rep_node} has degree {actual_degree}, reclassifying as junction")
+        else:
+            # Degree 2 - keep as endpoint but log
+            node_kind = 'endpoint'
+            logger.debug(f"Endpoint cluster rep node {rep_node} has degree {actual_degree}")
         
         node_id = f"N{node_counter}"
         true_node_idx = node_counter - 1  # 0-indexed position in nodes list
@@ -1233,8 +1272,8 @@ def extract_graph_from_polygon(
         nodes.append({
             'id': node_id,
             'xy': list(snapped_xy),
-            'kind': 'endpoint',
-            'degree': len(cluster_nodes),
+            'kind': node_kind,  # Classified based on actual degree
+            'degree': actual_degree,  # Use actual degree from contracted graph
             'cluster_nodes': cluster_nodes
         })
         
@@ -1246,6 +1285,39 @@ def extract_graph_from_polygon(
     
     node_build_time = time.time() - start
     logger.info(f"  Built {len(nodes)} true nodes ({len(junction_clusters)} junctions, {len(endpoint_clusters)} endpoints) in {node_build_time:.2f}s")
+    
+    # Reclassify nodes based on actual degree in contracted graph after clustering
+    degrees_contracted = dict(contracted_graph.degree())
+    reclassified_count = 0
+    for node in nodes:
+        # Get the skeleton node ID(s) for this true node
+        skeleton_node_ids = node.get('cluster_nodes', [])
+        if not skeleton_node_ids:
+            continue
+        
+        # Use the first skeleton node to get degree (all nodes in cluster should have same connectivity)
+        skeleton_node_id = skeleton_node_ids[0]
+        actual_degree = degrees_contracted.get(skeleton_node_id, 0)
+        
+        # Reclassify based on actual degree
+        if actual_degree == 1 and node['kind'] != 'endpoint':
+            logger.debug("Reclassifying node %s from %s to endpoint (degree=1 in contracted graph)", 
+                        node['id'], node['kind'])
+            node['kind'] = 'endpoint'
+            node['degree'] = actual_degree
+            reclassified_count += 1
+        elif actual_degree >= 3 and node['kind'] != 'junction':
+            logger.debug("Reclassifying node %s from %s to junction (degree=%d in contracted graph)", 
+                        node['id'], node['kind'], actual_degree)
+            node['kind'] = 'junction'
+            node['degree'] = actual_degree
+            reclassified_count += 1
+        else:
+            # Update degree to match contracted graph
+            node['degree'] = actual_degree
+    
+    if reclassified_count > 0:
+        logger.info(f"  Reclassified {reclassified_count} nodes based on contracted graph degree")
     
     # Export debug image: D_nodes (after node building)
     if debug_output_dir:
@@ -1259,7 +1331,8 @@ def extract_graph_from_polygon(
                 contracted_graph=contracted_graph,
                 junction_clusters=junction_clusters,
                 endpoint_clusters=endpoint_clusters,
-                nodes=nodes
+                nodes=nodes,
+                polygon=polygon  # Pass polygon to show boundaries like C2_contracted
             )
             logger.debug("Debug image saved: %s", debug_path)
         except Exception as e:
