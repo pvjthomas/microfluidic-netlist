@@ -331,6 +331,16 @@ def run_pipeline(
         # Default to minimum_channel_width if not specified
         L_spur_cutoff = minimum_channel_width
     
+    # Load corner_spur_cutoff from param file or use default
+    import math
+    if 'corner_spur_cutoff' in param_file_params:
+        corner_spur_cutoff = param_file_params['corner_spur_cutoff']
+        logger.info(f"Using corner_spur_cutoff from param file: {corner_spur_cutoff} µm")
+    else:
+        # Default to floor(minimum_channel_width/3)
+        corner_spur_cutoff = math.floor(minimum_channel_width / 3.0)
+        logger.debug(f"Using default corner_spur_cutoff={corner_spur_cutoff:.1f} µm (floor({minimum_channel_width:.1f}/3))")
+    
     # Compute width_sample_step from minimum_channel_width if not provided
     if width_sample_step is None:
         width_sample_step = minimum_channel_width / 3.0
@@ -506,7 +516,8 @@ def run_pipeline(
                 simplify_tolerance_factor=simplify_tolerance_factor,
                 endpoint_merge_distance_factor=endpoint_merge_distance_factor,
                 debug_output_dir=debug_output_dir,
-                L_spur_cutoff=L_spur_cutoff
+                L_spur_cutoff=L_spur_cutoff,
+                corner_spur_cutoff=corner_spur_cutoff
             )
             step_cd_time = time.time() - step_cd_start
             logger.info(f"Steps C & D: Completed in {step_cd_time:.2f}s")

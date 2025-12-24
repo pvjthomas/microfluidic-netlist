@@ -7,6 +7,7 @@ import numpy as np
 import networkx as nx
 import logging
 from pathlib import Path
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -248,27 +249,27 @@ def export_debug_image(
             
             draw.line([(u_px, u_py), (v_px, v_py)], fill=(200, 200, 255), width=1)
     
-    # Draw junction clusters (if provided) - 4x larger markers
+    # Draw junction clusters (if provided) - reduced by 4x
     if junction_clusters and graph_to_draw:
         for cluster_id, cluster_nodes in junction_clusters.items():
             for node_id in cluster_nodes:
                 if node_id in graph_to_draw:
                     xy = graph_to_draw.nodes[node_id]['xy']
                     x, y = clamp_coord(*world_to_image(xy[0], xy[1], xmin, ymin, um_per_px), image_width, image_height)
-                    radius = max(8, int(12 / um_per_px))  # 4x: 3 -> 12
+                    radius = max(2, int(3 / um_per_px))  # Reduced by 4x (was max(8, int(12 / um_per_px)))
                     bbox = clamp_bbox([x - radius, y - radius, x + radius, y + radius], image_width, image_height, outline_width=1)
                     # Draw in red for junctions
                     if bbox[2] > bbox[0] and bbox[3] > bbox[1]:  # Valid bbox
                         draw.ellipse(bbox, fill=(255, 100, 100), outline=(200, 0, 0))
     
-    # Draw endpoint clusters (if provided) - 4x larger markers
+    # Draw endpoint clusters (if provided) - reduced by 2x
     if endpoint_clusters and graph_to_draw:
         for cluster_id, cluster_nodes in endpoint_clusters.items():
             for node_id in cluster_nodes:
                 if node_id in graph_to_draw:
                     xy = graph_to_draw.nodes[node_id]['xy']
                     x, y = clamp_coord(*world_to_image(xy[0], xy[1], xmin, ymin, um_per_px), image_width, image_height)
-                    radius = max(8, int(12 / um_per_px))  # 4x: 3 -> 12
+                    radius = max(4, int(6 / um_per_px))  # Reduced by 2x (was max(8, int(12 / um_per_px)))
                     bbox = clamp_bbox([x - radius, y - radius, x + radius, y + radius], image_width, image_height, outline_width=1)
                     # Draw in green for endpoints
                     if bbox[2] > bbox[0] and bbox[3] > bbox[1]:  # Valid bbox
@@ -280,7 +281,7 @@ def export_debug_image(
         for node_id in endpoint_nodes:
             xy = contracted_graph.nodes[node_id]['xy']
             x, y = clamp_coord(*world_to_image(xy[0], xy[1], xmin, ymin, um_per_px), image_width, image_height)
-            radius = max(12, int(20 / um_per_px))  # Larger radius for visibility
+            radius = max(3, int(5 / um_per_px))  # Reduced by 2x (was max(6, int(10 / um_per_px)))
             bbox = clamp_bbox([x - radius, y - radius, x + radius, y + radius], image_width, image_height, outline_width=2)
             # Draw in green for endpoints
             if bbox[2] > bbox[0] and bbox[3] > bbox[1]:  # Valid bbox
@@ -376,4 +377,139 @@ def export_debug_image(
     # Save image
     img.save(output_path, 'PNG')
     logger.info("Debug image saved: %s (%d × %d pixels)", output_path, image_width, image_height)
+
+
+def export_colored_skeleton_pixels(
+    skeleton_graph: nx.Graph,
+    contracted_graph: nx.Graph,
+    junction_clusters: Dict[int, List[int]],
+    cluster_rep_map: Dict[int, int],
+    transform: Dict[str, float],
+    output_path: str
+) -> None:
+    """
+    Export a colored skeleton pixel image using the same color rules as C2_contracted.
+    
+    Colors:
+    - Green: Endpoint nodes (degree-1 in contracted_graph)
+    - Red: Junction cluster nodes
+    - Yellow: Cluster representatives
+    - Light blue: Default skeleton pixels
+    
+    Args:
+        skeleton_graph: Original skeleton graph with all nodes
+        contracted_graph: Contracted skeleton graph after junction clustering
+        junction_clusters: Dict mapping cluster_id to list of node IDs in junction clusters
+        cluster_rep_map: Dict mapping original node_id to representative node_id
+        transform: Transform dictionary with um_per_px, origin_x, origin_y
+        output_path: Output file path
+    """
+    logger.info("Exporting colored skeleton pixel image to: %s", output_path)
+    
+    if len(skeleton_graph) == 0:
+        logger.warning("Empty skeleton graph, cannot export colored skeleton image")
+        return
+    
+    # Use the transform's origin to compute image dimensions
+    # The transform tells us the original image bounds
+    # We need to find the bounds of all skeleton nodes and create an image that covers them
+    all_x = []
+    all_y = []
+    for node_id in skeleton_graph.nodes():
+        xy = skeleton_graph.nodes[node_id]['xy']
+        all_x.append(xy[0])
+        all_y.append(xy[1])
+    
+    if not all_x:
+        logger.warning("No nodes in skeleton graph")
+        return
+    
+    # Compute bounds relative to transform origin
+    um_per_px = transform['um_per_px']
+    origin_x = transform['origin_x']
+    origin_y = transform['origin_y']
+    
+    # Convert all coordinates to pixel space relative to origin
+    all_cols = [(x - origin_x) / um_per_px for x in all_x]
+    all_rows = [(y - origin_y) / um_per_px for y in all_y]
+    
+    # Find pixel bounds
+    min_col = int(min(all_cols))
+    max_col = int(max(all_cols)) + 1
+    min_row = int(min(all_rows))
+    max_row = int(max(all_rows)) + 1
+    
+    # Add small padding
+    padding_px = 10
+    min_col -= padding_px
+    max_col += padding_px
+    min_row -= padding_px
+    max_row += padding_px
+    
+    img_width = max_col - min_col
+    img_height = max_row - min_row
+    
+    logger.debug("Skeleton image dimensions: %d × %d pixels (covering %.1f × %.1f µm)",
+                img_width, img_height, img_width * um_per_px, img_height * um_per_px)
+    
+    # Create RGB image (black background)
+    img_array = np.zeros((img_height, img_width, 3), dtype=np.uint8)
+    
+    # Build sets for fast lookup
+    contracted_node_set = set(contracted_graph.nodes()) if contracted_graph else set()
+    contracted_degrees = dict(contracted_graph.degree()) if contracted_graph else {}
+    
+    # Build set of junction cluster nodes
+    junction_node_set = set()
+    for cluster_nodes in junction_clusters.values():
+        junction_node_set.update(cluster_nodes)
+    
+    # Build set of cluster representatives
+    rep_node_set = set(cluster_rep_map.values()) if cluster_rep_map else set()
+    
+    # Color each node
+    pixels_colored = 0
+    for node_id in skeleton_graph.nodes():
+        xy = skeleton_graph.nodes[node_id]['xy']
+        
+        # Convert to pixel coordinates relative to origin
+        col_orig = (xy[0] - origin_x) / um_per_px
+        row_orig = (xy[1] - origin_y) / um_per_px
+        
+        # Adjust for our image bounds (subtract min_col and min_row)
+        col = int(col_orig - min_col)
+        row = int(row_orig - min_row)
+        
+        # Invert row to account for np.flipud (skeleton images are flipped vertically)
+        # After flip, row 0 in image = max y in coords
+        row_in_image = img_height - 1 - row
+        
+        # Clamp to image bounds
+        if row_in_image < 0 or row_in_image >= img_height or col < 0 or col >= img_width:
+            continue
+        
+        # Determine color based on node role
+        color = (200, 200, 255)  # Default: light blue for skeleton pixels
+        
+        # Check if it's a cluster representative (highest priority)
+        if node_id in rep_node_set:
+            color = (255, 200, 0)  # Yellow for representatives
+        # Check if it's in a junction cluster
+        elif node_id in junction_node_set:
+            color = (255, 100, 100)  # Red for junctions
+        # Check if it's an endpoint in contracted graph
+        elif node_id in contracted_node_set and contracted_degrees.get(node_id, 0) == 1:
+            color = (100, 255, 100)  # Green for endpoints
+        
+        # Set pixel color
+        img_array[row_in_image, col] = color
+        pixels_colored += 1
+    
+    logger.debug("Colored %d skeleton pixels", pixels_colored)
+    
+    # Convert to PIL Image and save
+    img = Image.fromarray(img_array, mode='RGB')
+    img.save(output_path, 'PNG')
+    logger.info("Colored skeleton pixel image saved: %s (%d × %d pixels, %d pixels colored)",
+                output_path, img_width, img_height, pixels_colored)
 

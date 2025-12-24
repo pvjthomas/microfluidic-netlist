@@ -7,6 +7,11 @@ import networkx as nx
 from skimage.morphology import thin, medial_axis, binary_closing, binary_opening, disk
 from skimage import measure
 from scipy import ndimage
+try:
+    from scipy.spatial import cKDTree
+    HAS_SCIPY_SPATIAL = True
+except ImportError:
+    HAS_SCIPY_SPATIAL = False
 from typing import List, Tuple, Dict, Any, Optional
 import logging
 import time
@@ -15,6 +20,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +361,8 @@ def skeletonize_polygon(
     polygon: Polygon,
     um_per_px: float,
     L_spur_cutoff: float,
-    simplify_tolerance: Optional[float] = None
+    simplify_tolerance: Optional[float] = None,
+    corner_spur_cutoff: Optional[float] = None
 ) -> Tuple[nx.Graph, Dict[str, Any]]:
     """
     Skeletonize a polygon and convert to a NetworkX graph.
@@ -366,6 +373,9 @@ def skeletonize_polygon(
         L_spur_cutoff: Maximum length in microns for spur pruning. Spurs shorter than
                       this that end at junctions (degree >= 3) will be removed.
         simplify_tolerance: Tolerance for simplifying centerlines (in original units).
+        corner_spur_cutoff: Optional maximum length in microns for pruning corner burrs.
+                          Spurs shorter than this that end at degree-2 nodes will be removed.
+                          If None, corner burrs are not pruned. Default: None.
                            If None, auto-computed as 0.5 * um_per_px.
     
     Returns:
@@ -677,6 +687,8 @@ def skeletonize_polygon(
     start = time.time()
     try:
         skeleton_pixels = np.argwhere(skeleton_img)
+        # Canonicalize skeleton pixels by sorting (ensures deterministic order)
+        skeleton_pixels = np.array(sorted(map(tuple, skeleton_pixels)))
         find_time = time.time() - start
         logger.info(f"  Finding skeleton pixels: {find_time:.2f}s")
         logger.debug("skeletonize_polygon: found %d skeleton pixels", len(skeleton_pixels))
@@ -801,6 +813,8 @@ def skeletonize_polygon(
     
     # 2. Skeleton spur pruning: prune short spurs that end at junctions
     logger.debug("Pruning skeleton spurs: L_spur_cutoff = %.1f µm", L_spur_cutoff)
+    if corner_spur_cutoff is not None:
+        logger.debug("Pruning corner spurs: corner_spur_cutoff = %.1f µm", corner_spur_cutoff)
     
     spurs_pruned = 0
     max_iterations = 100  # Safety limit
@@ -855,10 +869,20 @@ def skeletonize_polygon(
                 path.append(next_node)
                 current = next_node
             
-            # If we reached a junction (deg >= 3) and path length <= L_spur_cutoff, mark for removal
+            # Mark for removal based on terminal degree and path length
             if terminal_node is not None:
                 terminal_degree = G.degree(terminal_node)
-                if terminal_degree >= 3 and path_length <= L_spur_cutoff and len(path) > 1:
+                should_remove = False
+                
+                # Rule 1: Junction spurs (terminal_degree >= 3) with L_spur_cutoff
+                if terminal_degree >= 3 and path_length <= L_spur_cutoff:
+                    should_remove = True
+                
+                # Rule 2: Corner burrs (terminal_degree == 2) with corner_spur_cutoff
+                elif terminal_degree == 2 and corner_spur_cutoff is not None and path_length <= corner_spur_cutoff:
+                    should_remove = True
+                
+                if should_remove:
                     paths_to_remove.append((path, terminal_node))
         
         if not paths_to_remove:
@@ -875,7 +899,11 @@ def skeletonize_polygon(
         logger.debug("Pruning iteration %d: removed %d nodes from %d spurs",
                     iteration + 1, sum(len(p) for p, _ in paths_to_remove), len(paths_to_remove))
     
-    logger.info(f"Pruned {spurs_pruned} spur pixels ({iteration+1} iterations, L_spur_cutoff={L_spur_cutoff:.1f} µm)")
+    log_msg = f"Pruned {spurs_pruned} spur pixels ({iteration+1} iterations, L_spur_cutoff={L_spur_cutoff:.1f} µm"
+    if corner_spur_cutoff is not None:
+        log_msg += f", corner_spur_cutoff={corner_spur_cutoff:.1f} µm"
+    log_msg += ")"
+    logger.info(log_msg)
     
     # Save skeleton image after pruning
     try:
@@ -1420,43 +1448,230 @@ def build_vector_centerline_graph(
 
 
 def cluster_junction_pixels(
-    skeleton_graph: nx.Graph,
-    um_per_px: float
+    G: nx.Graph,
+    um_per_px: float,
+    *,
+    channel_width_um: Optional[float] = None,
+    degree_threshold: int = 3,
+    bridge_hops: int = 1,
+    max_merge_dist_um: Optional[float] = None,
 ) -> Dict[int, List[int]]:
     """
-    Cluster junction pixels into connected components.
+    Cluster junction pixels using graph-bridge connectivity and spatial proximity.
+    
+    Robust clustering for microfluidic skeletons from skimage.medial_axis that handles:
+    - Junction nodes connected by short paths through degree-2 nodes (J-2-J patterns)
+    - Spatially close junction nodes within a distance threshold
     
     Args:
-        skeleton_graph: NetworkX graph from skeletonization
+        G: NetworkX skeleton graph with nodes having 'xy' attribute (world coordinates)
         um_per_px: Resolution (microns per pixel)
-        
+        channel_width_um: Optional channel width in microns (used to compute max_merge_dist_um)
+        degree_threshold: Minimum degree to consider a node a junction (default: 3)
+        bridge_hops: Maximum number of degree-2 intermediate nodes between junctions (default: 1)
+                     bridge_hops=1 merges J-2-J patterns, bridge_hops=2 merges J-2-2-J, etc.
+        max_merge_dist_um: Maximum distance in microns for spatial clustering (default: auto)
+                          If None: uses 0.75 * channel_width_um if given, else 3.0 * um_per_px
+    
     Returns:
-        Dict mapping cluster_id to list of node IDs in that cluster
+        Dict mapping cluster_id -> list of node IDs in that cluster
+    
+    Examples:
+        # J-2-J pattern: two junction nodes connected by one degree-2 node
+        # With bridge_hops=1, these will be merged into one cluster
+        # Graph: J1 --(deg2)-- J2
+        # Result: {0: [J1, J2]}
+        
+        # J-2-2-J pattern: two junction nodes connected by two degree-2 nodes
+        # With bridge_hops=2, these will be merged
+        # Graph: J1 --(deg2)--(deg2)-- J2
+        # Result: {0: [J1, J2]}
+        
+        # Spatially close junctions: two junction nodes within max_merge_dist_um
+        # Result: {0: [J1, J2]} (merged by spatial proximity)
     """
     # Compute degrees
-    degrees = dict(skeleton_graph.degree())
+    degrees = dict(G.degree())
     
-    # Identify junction pixels (degree >= 3)
-    junction_nodes = [n for n in skeleton_graph.nodes() if degrees.get(n, 0) >= 3]
+    # Identify candidate junction nodes
+    junction_nodes = [n for n in G.nodes() if degrees.get(n, 0) >= degree_threshold]
     
     if not junction_nodes:
+        logger.debug("cluster_junction_pixels: no junction nodes found (degree >= %d)", degree_threshold)
         return {}
     
-    # Create subgraph with only junction nodes and their connections
-    junction_subgraph = skeleton_graph.subgraph(junction_nodes).copy()
+    logger.debug("cluster_junction_pixels: found %d junction nodes (degree >= %d)", 
+                len(junction_nodes), degree_threshold)
     
-    # Find connected components
+    # Compute max_merge_dist_um if not provided
+    if max_merge_dist_um is None:
+        if channel_width_um is not None:
+            max_merge_dist_um = 0.75 * channel_width_um
+        else:
+            max_merge_dist_um = 3.0 * um_per_px
+        logger.debug("cluster_junction_pixels: auto-computed max_merge_dist_um=%.2f µm", max_merge_dist_um)
+    
+    # Build auxiliary graph JG for clustering: nodes are junction nodes, edges connect if:
+    # A) Connected by bridge path (J-2-...-2-J with <= bridge_hops intermediates)
+    # B) Within spatial distance max_merge_dist_um
+    JG = nx.Graph()
+    JG.add_nodes_from(junction_nodes)
+    
+    # Helper: get node coordinates
+    def get_node_xy(node_id):
+        """Get node coordinates, handling different attribute formats."""
+        if 'xy' in G.nodes[node_id]:
+            return G.nodes[node_id]['xy']
+        elif 'row' in G.nodes[node_id] and 'col' in G.nodes[node_id]:
+            # Fallback: convert row/col to approximate xy (assumes um_per_px scaling)
+            row = G.nodes[node_id]['row']
+            col = G.nodes[node_id]['col']
+            # This is approximate - ideally we'd have the transform
+            return (col * um_per_px, row * um_per_px)
+        else:
+            raise ValueError(f"Node {node_id} missing 'xy' or 'row'/'col' attributes")
+    
+    # A) Graph-bridge connectivity: BFS from each junction to find other junctions
+    # connected by paths of length <= bridge_hops+1 through degree-2 nodes
+    logger.debug("cluster_junction_pixels: checking bridge connectivity (bridge_hops=%d)", bridge_hops)
+    bridge_edges = 0
+    
+    for j1 in junction_nodes:
+        # BFS limited to depth bridge_hops+1, only traversing degree-2 intermediates
+        visited = {j1}
+        queue = [(j1, 0)]  # (node, depth)
+        
+        while queue:
+            current, depth = queue.pop(0)
+            
+            if depth > bridge_hops + 1:
+                continue
+            
+            # Check neighbors
+            for neighbor in G.neighbors(current):
+                if neighbor in visited:
+                    continue
+                
+                neighbor_degree = degrees.get(neighbor, 0)
+                
+                # If we reached another junction (degree >= threshold), add edge
+                if neighbor_degree >= degree_threshold and neighbor in junction_nodes:
+                    if not JG.has_edge(j1, neighbor):
+                        JG.add_edge(j1, neighbor)
+                        bridge_edges += 1
+                    # Don't continue BFS from junction nodes
+                    continue
+                
+                # If intermediate node has degree == 2, continue BFS
+                if neighbor_degree == 2 and depth < bridge_hops + 1:
+                    visited.add(neighbor)
+                    queue.append((neighbor, depth + 1))
+    
+    logger.debug("cluster_junction_pixels: found %d bridge edges", bridge_edges)
+    
+    # B) Spatial proximity: find junction nodes within max_merge_dist_um
+    logger.debug("cluster_junction_pixels: checking spatial proximity (max_dist=%.2f µm)", max_merge_dist_um)
+    spatial_edges = 0
+    
+    # Get coordinates for all junction nodes
+    junction_coords = []
+    junction_to_idx = {}
+    for idx, j in enumerate(junction_nodes):
+        xy = get_node_xy(j)
+        junction_coords.append(xy)
+        junction_to_idx[j] = idx
+    
+    junction_coords_array = np.array(junction_coords)
+    
+    # Use KDTree if available for efficient spatial queries
+    if HAS_SCIPY_SPATIAL and len(junction_nodes) > 10:
+        tree = cKDTree(junction_coords_array)
+        # Query all pairs within max_merge_dist_um
+        pairs = tree.query_pairs(max_merge_dist_um, output_type='set')
+        for i, j in pairs:
+            j1 = junction_nodes[i]
+            j2 = junction_nodes[j]
+            if not JG.has_edge(j1, j2):
+                JG.add_edge(j1, j2)
+                spatial_edges += 1
+    else:
+        # Fallback: O(n^2) check
+        if len(junction_nodes) > 100:
+            logger.warning("cluster_junction_pixels: large junction set (%d nodes), "
+                          "consider installing scipy for faster spatial queries", len(junction_nodes))
+        
+        for i, j1 in enumerate(junction_nodes):
+            xy1 = junction_coords_array[i]
+            for j2 in junction_nodes[i+1:]:
+                idx2 = junction_to_idx[j2]
+                xy2 = junction_coords_array[idx2]
+                dist = math.sqrt((xy1[0] - xy2[0])**2 + (xy1[1] - xy2[1])**2)
+                if dist <= max_merge_dist_um:
+                    if not JG.has_edge(j1, j2):
+                        JG.add_edge(j1, j2)
+                        spatial_edges += 1
+    
+    logger.debug("cluster_junction_pixels: found %d spatial edges", spatial_edges)
+    
+    # Find connected components in auxiliary graph
     clusters = {}
     cluster_id = 0
     
-    for component in nx.connected_components(junction_subgraph):
+    for component in nx.connected_components(JG):
         clusters[cluster_id] = list(component)
         cluster_id += 1
     
-    logger.debug("cluster_junction_pixels: found %d junction clusters from %d junction pixels",
-                len(clusters), len(junction_nodes))
+    # Log cluster statistics
+    if clusters:
+        cluster_sizes = [len(nodes) for nodes in clusters.values()]
+        logger.info("cluster_junction_pixels: clustered %d junction nodes into %d clusters "
+                   "(sizes: min=%d, max=%d, mean=%.1f)",
+                   len(junction_nodes), len(clusters),
+                   min(cluster_sizes), max(cluster_sizes), sum(cluster_sizes) / len(cluster_sizes))
+    else:
+        logger.info("cluster_junction_pixels: no clusters formed (all junctions isolated)")
     
     return clusters
+
+
+def junction_cluster_centroids(
+    G: nx.Graph,
+    clusters: Dict[int, List[int]]
+) -> Dict[int, Tuple[float, float]]:
+    """
+    Compute centroid of xy coordinates for each junction cluster.
+    
+    Args:
+        G: NetworkX graph with nodes having 'xy' attribute
+        clusters: Dict mapping cluster_id -> list of node IDs
+        
+    Returns:
+        Dict mapping cluster_id -> (x, y) centroid coordinates
+    """
+    centroids = {}
+    
+    for cluster_id, cluster_nodes in clusters.items():
+        if not cluster_nodes:
+            continue
+        
+        # Get coordinates for all nodes in cluster
+        coords = []
+        for node_id in cluster_nodes:
+            if 'xy' in G.nodes[node_id]:
+                coords.append(G.nodes[node_id]['xy'])
+            else:
+                logger.warning("junction_cluster_centroids: node %d missing 'xy' attribute", node_id)
+                continue
+        
+        if not coords:
+            continue
+        
+        # Compute centroid
+        cx = sum(c[0] for c in coords) / len(coords)
+        cy = sum(c[1] for c in coords) / len(coords)
+        centroids[cluster_id] = (cx, cy)
+    
+    return centroids
 
 
 def compute_cluster_centroid(
@@ -1490,14 +1705,19 @@ def find_cluster_representative(
     cluster_nodes: List[int]
 ) -> int:
     """
-    Find the representative node for a cluster (closest to centroid).
+    Find the representative node for a cluster using deterministic rules.
+    
+    Selection criteria (in priority order):
+    1. Closest to cluster centroid
+    2. Minimum node ID (if distances are equal)
+    3. Lexicographically smallest (x, y) coordinates (if node IDs are equal)
     
     Args:
         skeleton_graph: NetworkX graph
         cluster_nodes: List of node IDs in cluster
         
     Returns:
-        Node ID closest to cluster centroid
+        Representative node ID determined by the above rules
     """
     if not cluster_nodes:
         raise ValueError("Empty cluster")
@@ -1507,19 +1727,19 @@ def find_cluster_representative(
     centroid = compute_cluster_centroid(skeleton_graph, cluster_nodes)
     centroid_point = Point(centroid)
     
-    # Find node closest to centroid
-    min_dist = float('inf')
-    rep_node = cluster_nodes[0]
-    
+    # Compute distances for all nodes
+    candidates = []
     for node_id in cluster_nodes:
         node_xy = skeleton_graph.nodes[node_id]['xy']
         node_point = Point(node_xy)
         dist = centroid_point.distance(node_point)
-        if dist < min_dist:
-            min_dist = dist
-            rep_node = node_id
+        candidates.append((dist, node_id, node_xy))
     
-    return rep_node
+    # Sort by: 1) distance to centroid, 2) node ID, 3) lexicographic (x, y)
+    candidates.sort(key=lambda x: (x[0], x[1], x[2][0], x[2][1]))
+    
+    # Return the first candidate (closest to centroid, then min node ID, then lexicographically smallest)
+    return candidates[0][1]
 
 
 def validate_junction_cluster_arms(
@@ -1623,27 +1843,96 @@ def contract_junction_clusters(
         for node_id in cluster_nodes:
             cluster_rep_map[node_id] = rep_node
         
-        # For each cluster node, redirect its external neighbors to rep_node
-        nodes_to_remove = []
-        for node_id in cluster_nodes:
-            if node_id == rep_node:
-                continue  # Keep rep node
-            
-            # Get neighbors outside the cluster
-            for neighbor in list(contracted.neighbors(node_id)):
+        # Step 1: Collect all external neighbors (neighbors not in cluster_set)
+        external_neighbors = set()
+        for node_id in sorted(cluster_nodes):  # Sort for determinism
+            for neighbor in sorted(contracted.neighbors(node_id)):  # Sort for determinism
                 if neighbor not in cluster_set:
-                    # Add edge from rep to neighbor (if doesn't exist)
-                    if not contracted.has_edge(rep_node, neighbor):
-                        # Copy edge data if exists
-                        if contracted.has_edge(node_id, neighbor):
-                            edge_data = contracted.edges[node_id, neighbor]
-                            contracted.add_edge(rep_node, neighbor, **edge_data)
-                        else:
-                            contracted.add_edge(rep_node, neighbor)
-            
-            nodes_to_remove.append(node_id)
+                    external_neighbors.add(neighbor)
         
-        # Remove cluster nodes (except rep)
+        if not external_neighbors:
+            # No external neighbors, just remove cluster nodes except rep
+            nodes_to_remove = [n for n in sorted(cluster_nodes) if n != rep_node]
+            for node_id in nodes_to_remove:
+                contracted.remove_node(node_id)
+            continue
+        
+        # Step 2: Group external neighbors into arms using BFS
+        # An arm is a connected component reachable from a cluster node's neighbor
+        # without passing through any cluster node
+        arms = []  # List of sets, each set contains nodes in one arm
+        visited = set()
+        
+        for start_neighbor in sorted(external_neighbors):  # Sort for determinism
+            if start_neighbor in visited:
+                continue
+            
+            # BFS to find all nodes in this arm (connected component)
+            arm_nodes = set()
+            queue = [start_neighbor]
+            visited.add(start_neighbor)
+            
+            while queue:
+                current = queue.pop(0)
+                arm_nodes.add(current)
+                
+                # Explore neighbors, but skip cluster nodes
+                for neighbor in sorted(contracted.neighbors(current)):  # Sort for determinism
+                    if neighbor in cluster_set:
+                        continue  # Skip cluster nodes
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            
+            if arm_nodes:
+                arms.append(arm_nodes)
+        
+        # Step 3: For each arm, choose representative (smallest node ID)
+        arm_reps = {}  # Maps arm_index -> representative node_id
+        for arm_idx, arm_nodes in enumerate(arms):
+            # Choose node with smallest node ID
+            arm_rep = min(arm_nodes)
+            arm_reps[arm_idx] = arm_rep
+        
+        # Step 4: Connect rep_node to each arm representative exactly once
+        # and copy edge attributes from shortest existing edge
+        for arm_idx, arm_rep in arm_reps.items():
+            arm_nodes = arms[arm_idx]
+            
+            # Find shortest edge from any cluster node to any node in this arm
+            shortest_edge_data = None
+            shortest_length = float('inf')
+            
+            for cluster_node in sorted(cluster_nodes):  # Sort for determinism
+                for arm_node in sorted(arm_nodes):  # Sort for determinism
+                    if contracted.has_edge(cluster_node, arm_node):
+                        # Get edge length (weight or compute from coordinates)
+                        edge_data = dict(contracted.edges[cluster_node, arm_node])
+                        
+                        # Compute edge length if weight not available
+                        if 'weight' in edge_data:
+                            length = edge_data['weight']
+                        else:
+                            # Compute Euclidean distance
+                            xy1 = contracted.nodes[cluster_node]['xy']
+                            xy2 = contracted.nodes[arm_node]['xy']
+                            length = ((xy2[0] - xy1[0])**2 + (xy2[1] - xy1[1])**2) ** 0.5
+                        
+                        if length < shortest_length:
+                            shortest_length = length
+                            shortest_edge_data = edge_data
+            
+            # Add edge from rep_node to arm_rep
+            if not contracted.has_edge(rep_node, arm_rep):
+                if shortest_edge_data is not None:
+                    # Copy edge attributes from shortest edge
+                    contracted.add_edge(rep_node, arm_rep, **shortest_edge_data)
+                else:
+                    # No existing edge found, create new edge
+                    contracted.add_edge(rep_node, arm_rep)
+        
+        # Step 5: Remove all cluster nodes except rep_node
+        nodes_to_remove = [n for n in sorted(cluster_nodes) if n != rep_node]  # Sort for determinism
         for node_id in nodes_to_remove:
             contracted.remove_node(node_id)
     

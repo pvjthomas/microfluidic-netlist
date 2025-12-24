@@ -891,8 +891,8 @@ def build_edges_by_terminal_walk(
     
     # Walk from each terminal
     for start_terminal in terminals:
-        # Find all unvisited neighbors
-        for neighbor in contracted_graph.neighbors(start_terminal):
+        # Find all unvisited neighbors (canonicalized by sorting)
+        for neighbor in sorted(contracted_graph.neighbors(start_terminal)):
             edge_key_start = edge_key(start_terminal, neighbor)
             if edge_key_start in visited_edges:
                 continue  # Already visited this edge
@@ -917,8 +917,8 @@ def build_edges_by_terminal_walk(
                     break
                 
                 # For degree-2 nodes, there are exactly 2 neighbors
-                # Choose the neighbor that's not prev
-                nbrs = list(contracted_graph.neighbors(current))
+                # Choose the neighbor that's not prev (canonicalized by sorting)
+                nbrs = sorted(contracted_graph.neighbors(current))
                 if len(nbrs) != 2:
                     logger.warning(f"Degree-2 node {current} has {len(nbrs)} neighbors, expected 2")
                     break
@@ -970,7 +970,7 @@ def build_edges_by_terminal_walk(
     if len(edges) == 0 and terminals:
         # Log one terminal's neighbor list and degrees for debugging
         sample_terminal = next(iter(terminals))
-        neighbors = list(contracted_graph.neighbors(sample_terminal))
+        neighbors = sorted(contracted_graph.neighbors(sample_terminal))
         neighbor_degrees = {n: degrees.get(n, 0) for n in neighbors}
         logger.warning("No edges found from terminal walk. Sample terminal %d: degree=%d, neighbors=%s, neighbor_degrees=%s",
                       sample_terminal, degrees.get(sample_terminal, 0), neighbors, neighbor_degrees)
@@ -991,7 +991,8 @@ def extract_graph_from_polygon(
     simplify_tolerance_factor: float = 0.5,
     endpoint_merge_distance_factor: float = 1.0,
     debug_output_dir: Optional[str] = None,
-    L_spur_cutoff: Optional[float] = None
+    L_spur_cutoff: Optional[float] = None,
+    corner_spur_cutoff: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Extract network graph from a polygon.
@@ -1026,11 +1027,19 @@ def extract_graph_from_polygon(
     # Use L_spur_cutoff if provided, otherwise default to minimum_channel_width
     if L_spur_cutoff is None:
         L_spur_cutoff = minimum_channel_width
+    
+    # Compute corner_spur_cutoff: default to floor(minimum_channel_width/3) if not provided
+    import math
+    if corner_spur_cutoff is None:
+        corner_spur_cutoff = math.floor(minimum_channel_width / 3.0)
+        logger.debug(f"Using default corner_spur_cutoff={corner_spur_cutoff:.1f} µm (floor({minimum_channel_width:.1f}/3))")
+    
     skeleton_graph, transform = skeletonize_polygon(
         polygon,
         um_per_px=um_per_px,
         L_spur_cutoff=L_spur_cutoff,
-        simplify_tolerance=simplify_tolerance
+        simplify_tolerance=simplify_tolerance,
+        corner_spur_cutoff=corner_spur_cutoff
     )
     
     # Export debug image: C_skeleton (after skeletonization)
@@ -1070,7 +1079,11 @@ def extract_graph_from_polygon(
     import time
     start = time.time()
     
-    junction_clusters_raw = cluster_junction_pixels(skeleton_graph, um_per_px)
+    junction_clusters_raw = cluster_junction_pixels(
+        skeleton_graph, 
+        um_per_px,
+        channel_width_um=minimum_channel_width
+    )
     logger.info(f"Clustered {sum(len(v) for v in junction_clusters_raw.values())} junction pixels into {len(junction_clusters_raw)} junction clusters")
     
     # D'3: Validate and D'2: Contract junction clusters (min_arms=3)
@@ -1108,6 +1121,29 @@ def extract_graph_from_polygon(
             logger.debug("Debug image saved: %s", debug_path)
         except Exception as e:
             logger.warning("Failed to export debug image C2_contracted: %s", e)
+    
+    # Export colored skeleton pixel image with C2_contracted color rules
+    try:
+        from .export_debug import export_colored_skeleton_pixels
+        from datetime import datetime
+        from pathlib import Path
+        
+        skeleton_output_dir = Path("skeleton_output")
+        skeleton_output_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        skeleton_path = skeleton_output_dir / f"skeleton_after_clustercontraction_{timestamp}.png"
+        
+        export_colored_skeleton_pixels(
+            skeleton_graph=skeleton_graph,
+            contracted_graph=contracted_graph,
+            junction_clusters=junction_clusters_raw,
+            cluster_rep_map=cluster_rep_map,
+            transform=transform,
+            output_path=str(skeleton_path)
+        )
+        logger.info("Colored skeleton pixel image saved: %s", skeleton_path)
+    except Exception as e:
+        logger.warning("Failed to export colored skeleton pixel image: %s", e)
     
     # Build forbidden set from contracted junction nodes (for endpoint merging guard)
     forbidden_nodes = set()
@@ -1853,7 +1889,8 @@ def extract_graph_from_polygons(
     simplify_tolerance_factor: float = 0.5,
     endpoint_merge_distance_factor: float = 1.0,
     debug_output_dir: Optional[str] = None,
-    L_spur_cutoff: Optional[float] = None
+    L_spur_cutoff: Optional[float] = None,
+    corner_spur_cutoff: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Extract network graph from multiple polygons (union first) and optionally detect ports.
@@ -1937,7 +1974,8 @@ def extract_graph_from_polygons(
         simplify_tolerance_factor=simplify_tolerance_factor,
         endpoint_merge_distance_factor=endpoint_merge_distance_factor,
         debug_output_dir=debug_output_dir,
-        L_spur_cutoff=L_spur_cutoff
+        L_spur_cutoff=L_spur_cutoff,
+        corner_spur_cutoff=corner_spur_cutoff
     )
     
     # Optionally detect ports

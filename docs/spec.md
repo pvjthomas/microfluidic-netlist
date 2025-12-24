@@ -331,6 +331,36 @@ Crop to tight mask bounds before skeletonize. After rasterization, crop the bina
 
 Keep architecture open for "multiscale refinement" later. Design the rasterization interface to allow future enhancements like adaptive resolution (higher resolution near junctions, lower in straight segments) or hierarchical skeletonization without breaking existing code paths.
 
+Post-skeletonization deterministic processing (C.2)
+
+To ensure reproducible results across runs, all graph processing steps after skeletonization use deterministic ordering:
+
+1. Skeleton pixel canonicalization:
+   - After finding skeleton pixels via np.argwhere(), sort all pixels lexicographically before node creation
+   - This ensures consistent node ID assignment regardless of pixel discovery order
+
+2. Cluster representative selection:
+   - When selecting a representative node for a junction cluster, use deterministic tie-breaking rules (in priority order):
+     a) Closest to cluster centroid
+     b) Minimum node ID (if distances are equal)
+     c) Lexicographically smallest (x, y) coordinates (if node IDs are equal)
+   - Never rely on "first encountered" iteration order
+
+3. Neighbor traversal canonicalization:
+   - All neighbor traversals use sorted(neighbors) to ensure deterministic iteration order
+   - Applies to: contracted graph neighbor iteration, terminal walk neighbor selection, and cluster contraction neighbor processing
+
+4. Arm-aware junction cluster contraction:
+   - Junction clusters are contracted using arm-aware logic:
+     a) Identify unique "arms" leaving each cluster (connected components reachable from cluster node neighbors without passing through cluster nodes)
+     b) For each arm, select ONE representative node deterministically (smallest node ID)
+     c) Connect cluster representative to each arm representative exactly once
+     d) Copy edge attributes from the shortest existing edge between any cluster node and that arm
+   - This prevents duplicate edges and ensures each arm is represented by a single connection
+   - All node lists are sorted before iteration to ensure determinism
+
+These deterministic behaviors ensure that identical input polygons produce identical graph structures, node IDs, and edge connections across multiple runs.
+
 D) Edge segmentation rules
 
 Build a graph where nodes are:
@@ -489,7 +519,7 @@ Input:
 {
   "session_id":"...",
   "tolerances": {...},
-  "width_sample_step": 10.0
+  "width_sample_step": 
 }
 
 
