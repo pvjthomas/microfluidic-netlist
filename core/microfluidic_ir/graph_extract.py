@@ -825,16 +825,19 @@ def split_edge_at_corners(
         hv_transition = (is_h1 and is_v2) or (is_v1 and is_h2)
         
         # Compute turning angle
+        # angle = acos(dot_product) gives:
+        #   0 = straight (vectors aligned)
+        #   π/2 = right angle (vectors perpendicular)
+        #   π = 180 degrees (vectors opposite)
         dot_product = vec1_x * vec2_x + vec1_y * vec2_y
         dot_product = max(-1.0, min(1.0, dot_product))  # Clamp for numerical stability
-        angle = math.acos(dot_product)
-        turn_angle = math.pi - angle  # Turn angle (0 = straight, pi = 180 deg turn)
+        angle = math.acos(dot_product)  # 0 = straight, π/2 = right angle, π = 180 deg turn
         
         # Check if this is a corner
         is_corner = False
         if hv_transition:
             is_corner = True
-        elif turn_angle > turn_thresh_rad:
+        elif angle > turn_thresh_rad:
             is_corner = True
         
         if is_corner:
@@ -867,12 +870,53 @@ def build_edges_by_terminal_walk(
     """
     Build edges by deterministic edge-walk decomposition from terminals.
     
-    Walks from each terminal along neighbors through degree-2 nodes until the next terminal,
-    marking traversed edges as visited so each skeleton edge is used exactly once.
+    Edge decomposition rule: Edges are maximal degree-2 paths between terminals.
+    
+    Algorithm:
+    1. Start from each terminal
+    2. For each unvisited incident edge:
+       - Walk forward through degree-2 nodes
+       - Stop when reaching a node with degree != 2 (treat as terminal)
+    3. Emit one edge per walk
+    
+    Cycle handling (mandatory):
+    - Cycles are valid structures (parallel paths N1 → N2)
+    - A walk may return to a previously visited node
+    - Stop a walk if:
+      * The next undirected edge is already visited, OR
+      * The walk reaches a degree ≠ 2 node
+    - Never expect cycles to have natural endpoints.
+    
+    Visited-edge tracking:
+    - Track edges, not nodes
+    - Each undirected edge must be emitted exactly once
+    - For MultiGraph: use (u, v, key) to track parallel edges
+    - For Graph: use tuple(sorted((u, v)))
+    
+    MultiGraph safety:
+    - If contracted_graph is a MultiGraph, parallel channels may exist
+    - Track edges using (u, v, key) - do not collapse to (u, v) only
+    - If unsure, convert explicitly: contracted_graph = nx.Graph(contracted_graph)
+    
+    Output semantics:
+    - Nodes represent endpoints and junctions
+    - Edges represent physical channels
+    - Parallel paths between the same terminals are distinct edges
+    - Do not merge them geometrically or topologically
+    
+    Non-goals (explicit):
+    - Do not force terminal-to-terminal paths only
+    - Do not assume acyclic graphs
+    - Do not assume junction clusters are complete or correct
+    - Do not prune parallel channels
+    
+    This works for: chains, Y-junctions, loops, parallel microfluidic channels.
     
     Args:
-        contracted_graph: NetworkX graph after junction contraction
-        terminals: Set of terminal skeleton node IDs (endpoint reps + junction reps with degree >= 3)
+        contracted_graph: NetworkX graph after junction contraction (Graph or MultiGraph)
+        terminals: Set of terminal skeleton node IDs (all nodes with degree ≠ 2 in contracted graph)
+                   - degree == 1 → endpoint
+                   - degree >= 3 → junction
         skeleton_node_to_true_node: Map from skeleton node ID to true node index
         nodes: List of true nodes (for looking up node IDs)
         um_per_px: Resolution in microns per pixel
@@ -880,20 +924,55 @@ def build_edges_by_terminal_walk(
     Returns:
         List of edge dicts with centerline coordinates
     """
+    # MultiGraph safety: Check if graph is MultiGraph and handle accordingly
+    is_multigraph = isinstance(contracted_graph, nx.MultiGraph)
+    if is_multigraph:
+        logger.debug("contracted_graph is a MultiGraph - parallel channels may exist, tracking edges with (u, v, key)")
+    else:
+        # If unsure, convert explicitly to Graph to avoid MultiGraph issues
+        if not isinstance(contracted_graph, nx.Graph):
+            logger.warning(f"contracted_graph is of type {type(contracted_graph)}, converting to Graph")
+            contracted_graph = nx.Graph(contracted_graph)
+            is_multigraph = False
+    
     edges = []
     edge_counter = 1
-    visited_edges = set()  # Set of (u, v) tuples (undirected edges)
+    # Visited-edge tracking: Track edges, not nodes
+    # Each undirected edge must be emitted exactly once
+    # For MultiGraph: use (u, v, key) to track parallel edges separately
+    # For Graph: use tuple(sorted((u, v)))
+    visited_edges = set()  # Set of edge identifiers
     degrees = dict(contracted_graph.degree())
     
     # Helper to get edge key (undirected)
-    def edge_key(u, v):
-        return tuple(sorted([u, v]))
+    # For MultiGraph: track (u, v, key) to handle parallel edges
+    # For Graph: use tuple(sorted((u, v)))
+    def edge_key(u, v, key=None):
+        if is_multigraph and key is not None:
+            # MultiGraph: use (u, v, key) to distinguish parallel edges
+            # Do not collapse to (u, v) only - parallel channels are distinct edges
+            return tuple(sorted([u, v])) + (key,)
+        else:
+            # Graph: use tuple(sorted((u, v)))
+            return tuple(sorted([u, v]))
     
-    # Walk from each terminal
-    for start_terminal in terminals:
-        # Find all unvisited neighbors (canonicalized by sorting)
-        for neighbor in sorted(contracted_graph.neighbors(start_terminal)):
-            edge_key_start = edge_key(start_terminal, neighbor)
+    # Edge decomposition rule: Start from each terminal
+    for start_terminal in sorted(terminals):  # Sort for deterministic ordering
+        # For each unvisited incident edge
+        # Handle MultiGraph: iterate over all parallel edges
+        neighbors_with_edges = []
+        if is_multigraph:
+            # MultiGraph: get all edges (including parallel ones)
+            for neighbor in sorted(contracted_graph.neighbors(start_terminal)):
+                for key in contracted_graph[start_terminal][neighbor]:
+                    neighbors_with_edges.append((neighbor, key))
+        else:
+            # Graph: simple neighbor list
+            for neighbor in sorted(contracted_graph.neighbors(start_terminal)):
+                neighbors_with_edges.append((neighbor, None))
+        
+        for neighbor, edge_key_mg in neighbors_with_edges:
+            edge_key_start = edge_key(start_terminal, neighbor, edge_key_mg)
             if edge_key_start in visited_edges:
                 continue  # Already visited this edge
             
@@ -901,45 +980,94 @@ def build_edges_by_terminal_walk(
             path = [start_terminal, neighbor]
             prev = start_terminal
             current = neighbor
+            current_edge_key = edge_key_mg  # Track edge key for MultiGraph
             visited_edges.add(edge_key_start)
             
-            # Walk through degree-2 nodes until we hit a terminal
+            # Walk forward through degree-2 nodes
+            # Cycle handling: A walk may return to a previously visited node (this is valid for cycles)
+            # Stop a walk if:
+            #   1. The next undirected edge is already visited, OR
+            #   2. The walk reaches a degree ≠ 2 node
+            # Never expect cycles to have natural endpoints.
             while True:
-                # Check if current is a terminal
-                if current in terminals:
-                    # Found path from start_terminal to current terminal
+                current_degree = degrees.get(current, 0)
+                
+                # Stop condition 1: Reached a node with degree != 2
+                # Treat it as a terminal (do not require it to be in precomputed terminal set)
+                # Critical: Treat any node with degree ≠ 2 as a terminal during the walk
+                # Never assume "non-degree-2 means error" - just break
+                if current_degree != 2:
                     break
                 
-                # Check if current has degree 2 (continue walking)
-                if degrees.get(current, 0) != 2:
-                    # Not a terminal and not degree-2, something went wrong
-                    logger.warning(f"Walk from terminal {start_terminal} hit non-terminal, non-degree-2 node {current}")
-                    break
-                
+                # Current is degree-2, continue walking
                 # For degree-2 nodes, there are exactly 2 neighbors
-                # Choose the neighbor that's not prev (canonicalized by sorting)
                 nbrs = sorted(contracted_graph.neighbors(current))
                 if len(nbrs) != 2:
                     logger.warning(f"Degree-2 node {current} has {len(nbrs)} neighbors, expected 2")
                     break
                 
+                # Choose the neighbor that's not prev (forward direction)
                 next_node = nbrs[0] if nbrs[1] == prev else nbrs[1]
                 
-                # Check if we've already walked this undirected edge
-                ek = edge_key(current, next_node)
-                if ek in visited_edges:
-                    # We've already walked this undirected edge; stop
-                    break
+                # Stop condition 2: Check if we've already walked this undirected edge
+                # Track edges, not nodes - a walk may return to a previously visited node
+                # (this is valid for cycles/parallel paths)
+                # For MultiGraph: need to find an unvisited edge key
+                if is_multigraph:
+                    # MultiGraph: find first unvisited edge between current and next_node
+                    next_edge_key = None
+                    for edge_key_mg in contracted_graph[current][next_node]:
+                        ek = edge_key(current, next_node, edge_key_mg)
+                        if ek not in visited_edges:
+                            next_edge_key = edge_key_mg
+                            break
+                    
+                    if next_edge_key is None:
+                        # All parallel edges between current and next_node are visited; stop
+                        break
+                    
+                    ek = edge_key(current, next_node, next_edge_key)
+                    visited_edges.add(ek)
+                    current_edge_key = next_edge_key
+                else:
+                    # Graph: simple edge check
+                    ek = edge_key(current, next_node)
+                    if ek in visited_edges:
+                        # We've already walked this undirected edge; stop
+                        # This can happen in cycles (parallel paths) or when another walk already covered this edge
+                        # Each undirected edge must be emitted exactly once
+                        break
+                    visited_edges.add(ek)
                 
-                visited_edges.add(ek)
+                # Mark edge as visited and continue walking
                 path.append(next_node)
                 prev, current = current, next_node
             
-            # If we found a path to another terminal, create edge
-            if len(path) >= 2 and current in terminals and current != start_terminal:
+            # Emit one edge per walk (if we reached a node with degree != 2)
+            # Treat any node with degree ≠ 2 as a terminal during the walk
+            # Do not require the node to be in a precomputed terminal set
+            # Cycle handling: Cycles are valid (parallel paths N1 → N2)
+            # A walk may return to the same terminal (creating a cycle edge)
+            # Never expect cycles to have natural endpoints
+            current_degree_after_walk = degrees.get(current, 0)
+            if len(path) >= 2 and current_degree_after_walk != 2:
+                # Skip trivial self-loops (direct connections without intermediate nodes)
+                # But allow cycles that return to the same terminal with intermediate nodes
+                if current == start_terminal and len(path) == 2:
+                    # Direct self-connection, skip (would create degenerate edge)
+                    # Continue to next neighbor
+                    continue
+                # Note: If current == start_terminal and len(path) > 2, this is a valid cycle edge
+                
                 # Get true node IDs
+                # If current node is not in mapping, it means it wasn't in the precomputed terminal set
+                # but we still treat it as a terminal (degree != 2)
                 start_true_idx = skeleton_node_to_true_node.get(start_terminal)
                 end_true_idx = skeleton_node_to_true_node.get(current)
+                
+                # Debug check: Log warning if walk hits a degree ≠ 2 node without a true-node mapping
+                if end_true_idx is None:
+                    logger.warning(f"Walk from terminal {start_terminal} hit node {current} (degree {current_degree_after_walk}) without a true-node mapping")
                 
                 if start_true_idx is not None and end_true_idx is not None:
                     start_node = nodes[start_true_idx]
@@ -965,8 +1093,16 @@ def build_edges_by_terminal_walk(
                                 'coordinates': [[float(x), float(y)] for x, y in pruned_coords]
                             }
                         })
+                else:
+                    # Missing true node mapping - this shouldn't happen if all nodes with degree != 2 are properly mapped
+                    # The earlier code should have created true nodes for all terminals
+                    if start_true_idx is None:
+                        logger.warning(f"Node {start_terminal} (degree {degrees.get(start_terminal, 0)}) has no true node mapping")
+                    if end_true_idx is None:
+                        logger.warning(f"Node {current} (degree {current_degree_after_walk}) has no true node mapping - treating as terminal but cannot create edge")
     
-    # Debug logging if no edges found
+    # Debug checks (enable during development)
+    # Check 1: Log warning if no edges are emitted from a graph with terminals
     if len(edges) == 0 and terminals:
         # Log one terminal's neighbor list and degrees for debugging
         sample_terminal = next(iter(terminals))
@@ -974,6 +1110,11 @@ def build_edges_by_terminal_walk(
         neighbor_degrees = {n: degrees.get(n, 0) for n in neighbors}
         logger.warning("No edges found from terminal walk. Sample terminal %d: degree=%d, neighbors=%s, neighbor_degrees=%s",
                       sample_terminal, degrees.get(sample_terminal, 0), neighbors, neighbor_degrees)
+    
+    # Check 2: Verify all degree-2 nodes have exactly 2 neighbors (already checked during walk)
+    # Check 3: Verify parallel paths are distinct edges (handled by MultiGraph edge tracking)
+    
+    logger.debug(f"Built {len(edges)} edges from {len(terminals)} terminals (is_multigraph={is_multigraph})")
     
     return edges
 
@@ -1321,6 +1462,65 @@ def extract_graph_from_polygon(
     if reclassified_count > 0:
         logger.info(f"  Reclassified {reclassified_count} nodes based on contracted graph degree")
     
+    # Ensure every terminal (degree ≠ 2) has a true node entry and skeleton_node_to_true_node mapping
+    # This prevents walks from stopping at unmapped junctions/endpoints
+    # Check all nodes in contracted graph for missing terminals
+    missing_terminals = []
+    for n, d in degrees_contracted.items():
+        if d != 2 and n not in skeleton_node_to_true_node:
+            missing_terminals.append((n, d))
+    
+    if missing_terminals:
+        logger.warning(f"Found {len(missing_terminals)} terminals missing from true node mapping, creating them now")
+        for skeleton_node_id, degree in missing_terminals:
+            # Get coordinates from contracted graph
+            if skeleton_node_id not in contracted_graph.nodes:
+                logger.warning(f"Terminal {skeleton_node_id} not found in contracted graph, skipping")
+                continue
+            
+            xy_raw = contracted_graph.nodes[skeleton_node_id]['xy']
+            
+            # Classify based on degree
+            if degree == 1:
+                node_kind = 'endpoint'
+                # For endpoints, snap to polygon boundary
+                # snap_endpoint_to_boundary expects tuple
+                snapped_xy = snap_endpoint_to_boundary(
+                    tuple(xy_raw),
+                    polygon,
+                    contracted_graph,
+                    skeleton_node_id,
+                    incident_edge_coords=None
+                )
+                xy = list(snapped_xy)
+            elif degree >= 3:
+                node_kind = 'junction'
+                # For junctions, use coordinates as-is (ensure list format)
+                xy = list(xy_raw) if not isinstance(xy_raw, list) else xy_raw
+            else:
+                # Shouldn't happen (degree != 2), but handle gracefully
+                node_kind = 'junction'
+                logger.warning(f"Terminal {skeleton_node_id} has unexpected degree {degree}, treating as junction")
+            
+            # Create true node
+            node_id = f"N{node_counter}"
+            true_node_idx = node_counter - 1
+            node_counter += 1
+            true_nodes[true_node_idx] = tuple(xy)
+            skeleton_node_to_true_node[skeleton_node_id] = true_node_idx
+            
+            nodes.append({
+                'id': node_id,
+                'xy': xy,
+                'kind': node_kind,
+                'degree': degree,
+                'cluster_nodes': [skeleton_node_id]  # Single node cluster
+            })
+            
+            logger.debug(f"Created missing true node {node_id} for terminal {skeleton_node_id} (degree={degree}, kind={node_kind})")
+        
+        logger.info(f"Created {len(missing_terminals)} true nodes for missing terminals")
+    
     # Export debug image: D_nodes (after node building)
     if debug_output_dir:
         try:
@@ -1341,26 +1541,18 @@ def extract_graph_from_polygon(
             logger.warning("Failed to export debug image D_nodes: %s", e)
     
     # C) Rebuild edges by deterministic edge-walk decomposition from terminals
-    # Build terminal set: endpoint reps + junction reps with degree >= 3
+    # Build terminal set: ALL nodes with degree ≠ 2 in the contracted graph (authoritative definition)
+    # This is more robust than relying on cluster membership alone
     start = time.time()
-    terminals = set()
     degrees = dict(contracted_graph.degree())
     
-    # Add endpoint reps (from endpoint clusters)
-    # Use one rep per endpoint cluster (not all nodes in cluster)
-    # Even if the walk is fixed, having multiple terminals at one endpoint can cause tiny degenerate edges
-    for cluster_nodes in endpoint_clusters.values():
-        rep = next((n for n in cluster_nodes if degrees.get(n, 0) == 1), cluster_nodes[0])
-        terminals.add(rep)
-    
-    # Add junction reps (from contracted junction clusters where degree >= 3)
-    for cluster_nodes in junction_clusters.values():
-        for rep_node in cluster_nodes:
-            if degrees.get(rep_node, 0) >= 3:
-                terminals.add(rep_node)
+    # Authoritative definition: terminals = {n for n, d in contracted_graph.degree() if d != 2}
+    # degree == 1 → endpoint
+    # degree >= 3 → junction
+    terminals = {n for n, d in contracted_graph.degree() if d != 2}
     
     logger.info("contracted_graph: %d nodes, %d edges", contracted_graph.number_of_nodes(), contracted_graph.number_of_edges())
-    logger.info("terminals: %d, endpoint_terms=%d, junction_terms=%d",
+    logger.info("terminals: %d (authoritative: all nodes with degree ≠ 2), endpoint_terms=%d, junction_terms=%d",
                 len(terminals),
                 sum(1 for t in terminals if degrees.get(t, 0) == 1),
                 sum(1 for t in terminals if degrees.get(t, 0) >= 3))
