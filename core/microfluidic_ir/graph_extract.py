@@ -992,7 +992,8 @@ def extract_graph_from_polygon(
     endpoint_merge_distance_factor: float = 1.0,
     debug_output_dir: Optional[str] = None,
     L_spur_cutoff: Optional[float] = None,
-    corner_spur_cutoff: Optional[float] = None
+    corner_spur_cutoff: Optional[float] = None,
+    e_Ramer_Douglas_Peucker: float = 10.0
 ) -> Dict[str, Any]:
     """
     Extract network graph from a polygon.
@@ -1009,6 +1010,7 @@ def extract_graph_from_polygon(
         per_edge_overrides: Optional dict mapping edge_id to override dict
         simplify_tolerance_factor: Factor to multiply minimum_channel_width for simplify_tolerance (default: 0.5)
         endpoint_merge_distance_factor: Factor to multiply minimum_channel_width for endpoint merge distance (default: 1.0)
+        e_Ramer_Douglas_Peucker: Epsilon parameter for Ramer-Douglas-Peucker simplification before corner detection (default: 10.0 µm)
     
     Returns:
         Dictionary with:
@@ -1374,6 +1376,7 @@ def extract_graph_from_polygon(
     
     # Detect corners and split edges at corner points
     # This creates "corner" nodes (degree-2 topologically) and splits polylines
+    # First, apply Ramer-Douglas-Peucker simplification to reduce noise before corner detection
     edge_counter = len(edges) + 1
     new_edges = []
     corner_nodes = []  # New corner nodes to add
@@ -1381,14 +1384,40 @@ def extract_graph_from_polygon(
     
     for edge in edges:
         centerline_coords = [tuple(c) for c in edge['centerline']['coordinates']]
+        
+        # Apply Ramer-Douglas-Peucker simplification before corner detection
+        if len(centerline_coords) > 2 and e_Ramer_Douglas_Peucker > 0:
+            from shapely.geometry import LineString
+            try:
+                line = LineString(centerline_coords)
+                simplified_line = line.simplify(e_Ramer_Douglas_Peucker, preserve_topology=False)
+                # Convert back to list of tuples
+                if simplified_line.geom_type == 'LineString':
+                    centerline_coords = [tuple(coord) for coord in simplified_line.coords]
+                    logger.debug(f"RDP simplified edge {edge['id']}: {len(edge['centerline']['coordinates'])} -> {len(centerline_coords)} points")
+                else:
+                    # If simplification produces MultiLineString, use original
+                    logger.warning(f"RDP simplification produced {simplified_line.geom_type} for edge {edge['id']}, using original")
+            except Exception as e:
+                logger.warning(f"Failed to apply RDP simplification to edge {edge['id']}: {e}, using original")
+        
         corner_indices = split_edge_at_corners(centerline_coords, um_per_px, turn_thresh_deg=30.0)
         
         # Dedupe and sort corner indices before use
         corner_indices = sorted(set(corner_indices))
         
         if len(corner_indices) <= 2:
-            # No corners detected, keep edge as-is
-            new_edges.append(edge)
+            # No corners detected, keep edge as-is but update centerline if RDP was applied
+            if len(centerline_coords) != len(edge['centerline']['coordinates']):
+                # RDP was applied, update the edge's centerline
+                updated_edge = edge.copy()
+                updated_edge['centerline'] = {
+                    'type': 'LineString',
+                    'coordinates': [[float(x), float(y)] for x, y in centerline_coords]
+                }
+                new_edges.append(updated_edge)
+            else:
+                new_edges.append(edge)
         else:
             # Split edge at corners
             u_node_id = edge['u']
@@ -1963,7 +1992,8 @@ def extract_graph_from_polygons(
     endpoint_merge_distance_factor: float = 1.0,
     debug_output_dir: Optional[str] = None,
     L_spur_cutoff: Optional[float] = None,
-    corner_spur_cutoff: Optional[float] = None
+    corner_spur_cutoff: Optional[float] = None,
+    e_Ramer_Douglas_Peucker: float = 10.0
 ) -> Dict[str, Any]:
     """
     Extract network graph from multiple polygons (union first) and optionally detect ports.
@@ -2048,7 +2078,8 @@ def extract_graph_from_polygons(
         endpoint_merge_distance_factor=endpoint_merge_distance_factor,
         debug_output_dir=debug_output_dir,
         L_spur_cutoff=L_spur_cutoff,
-        corner_spur_cutoff=corner_spur_cutoff
+        corner_spur_cutoff=corner_spur_cutoff,
+        e_Ramer_Douglas_Peucker=e_Ramer_Douglas_Peucker
     )
     
     # Optionally detect ports

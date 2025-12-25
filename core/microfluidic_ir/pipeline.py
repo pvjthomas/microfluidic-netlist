@@ -341,6 +341,18 @@ def run_pipeline(
         corner_spur_cutoff = math.floor(minimum_channel_width / 3.0)
         logger.debug(f"Using default corner_spur_cutoff={corner_spur_cutoff:.1f} µm (floor({minimum_channel_width:.1f}/3))")
     
+    # Load e_Ramer_Douglas_Peucker from param file or use default (10um)
+    # Handle both correct spelling and typo (Dougles -> Douglas)
+    e_rdp = 10.0  # Default 10um
+    if 'e_Ramer_Douglas_Peucker' in param_file_params:
+        e_rdp = param_file_params['e_Ramer_Douglas_Peucker']
+        logger.info(f"Using e_Ramer_Douglas_Peucker from param file: {e_rdp} µm")
+    elif 'e_Ramer_Dougles_Peucker' in param_file_params:  # Handle typo
+        e_rdp = param_file_params['e_Ramer_Dougles_Peucker']
+        logger.info(f"Using e_Ramer_Dougles_Peucker from param file: {e_rdp} µm (note: correct spelling is e_Ramer_Douglas_Peucker)")
+    else:
+        logger.debug(f"Using default e_Ramer_Douglas_Peucker={e_rdp:.1f} µm")
+    
     # Compute width_sample_step from minimum_channel_width if not provided
     if width_sample_step is None:
         width_sample_step = minimum_channel_width / 3.0
@@ -517,7 +529,8 @@ def run_pipeline(
                 endpoint_merge_distance_factor=endpoint_merge_distance_factor,
                 debug_output_dir=debug_output_dir,
                 L_spur_cutoff=L_spur_cutoff,
-                corner_spur_cutoff=corner_spur_cutoff
+                corner_spur_cutoff=corner_spur_cutoff,
+                e_Ramer_Douglas_Peucker=e_rdp
             )
             step_cd_time = time.time() - step_cd_start
             logger.info(f"Steps C & D: Completed in {step_cd_time:.2f}s")
@@ -569,7 +582,8 @@ def run_pipeline(
                     default_cross_section_kind=default_cross_section_kind,
                     per_edge_overrides=per_edge_overrides,
                     simplify_tolerance_factor=simplify_tolerance_factor,
-                    endpoint_merge_distance_factor=endpoint_merge_distance_factor
+                    endpoint_merge_distance_factor=endpoint_merge_distance_factor,
+                    e_Ramer_Douglas_Peucker=e_rdp
                 )
             
             enabled_list = [step for step, enabled in visualizer.enabled_steps.items() if enabled]

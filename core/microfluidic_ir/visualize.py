@@ -1010,7 +1010,8 @@ class PipelineVisualizer:
                 default_cross_section_kind=self.compute_params.get('default_cross_section_kind', 'rectangular'),
                 per_edge_overrides=self.compute_params.get('per_edge_overrides'),
                 simplify_tolerance_factor=self.compute_params.get('simplify_tolerance_factor', 0.5),
-                endpoint_merge_distance_factor=self.compute_params.get('endpoint_merge_distance_factor', 1.0)
+                endpoint_merge_distance_factor=self.compute_params.get('endpoint_merge_distance_factor', 1.0),
+                e_Ramer_Douglas_Peucker=self.compute_params.get('e_Ramer_Douglas_Peucker', 10.0)
             )
             t1 = time.time()
             print(f"  [Step D] Extract full graph: {t1 - t0:.3f}s")
