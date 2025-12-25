@@ -75,7 +75,7 @@ class PipelineVisualizer:
     def _draw_step_a(self):
         """Draw Step A: DXF polygons and circles."""
         self.ax.cla()  # Faster than clear() - doesn't reset all properties
-        self.ax.set_title('Step A: DXF Import & Normalization', fontsize=14, fontweight='bold')
+        self.ax.set_title('Step A: DXF Import & Normalization', fontsize=10, fontweight='bold')  # Reduced by 30%: 14 * 0.7 = 9.8 -> 10
         
         data = self.data.get('A', {})
         polygons = data.get('polygons', [])
@@ -121,12 +121,12 @@ class PipelineVisualizer:
         info = f"Polygons: {len(polygons)}, Circles: {len(circles)}"
         self.ax.text(0.02, 0.98, info, transform=self.ax.transAxes,
                     verticalalignment='top', bbox=dict(boxstyle='round', 
-                    facecolor='wheat', alpha=0.5), fontsize=10)
+                    facecolor='wheat', alpha=0.5), fontsize=7)  # Reduced by 30%: 10 * 0.7 = 7
     
     def _draw_step_b(self):
         """Draw Step B: Selected channel regions."""
         self.ax.cla()  # Faster than clear() - doesn't reset all properties
-        self.ax.set_title('Step B: Channel Region Selection', fontsize=14, fontweight='bold')
+        self.ax.set_title('Step B: Channel Region Selection', fontsize=10, fontweight='bold')  # Reduced by 30%: 14 * 0.7 = 9.8 -> 10
         
         data = self.data.get('B', {})
         selected_polygons = data.get('selected_polygons', [])
@@ -193,7 +193,7 @@ class PipelineVisualizer:
         info = f"Selected Regions: {len(selected_polygons)}"
         self.ax.text(0.02, 0.98, info, transform=self.ax.transAxes,
                     verticalalignment='top', bbox=dict(boxstyle='round',
-                    facecolor='wheat', alpha=0.5), fontsize=10)
+                    facecolor='wheat', alpha=0.5), fontsize=7)  # Reduced by 30%: 10 * 0.7 = 7
     
     def _draw_step_c(self):
         """Draw Step C: Skeleton (medial axis)."""
@@ -202,17 +202,17 @@ class PipelineVisualizer:
         # Check if step is computed
         if 'C' not in self.computed_steps:
             self.ax.set_title('Step C: Skeleton Extraction (Click Next to compute)', 
-                             fontsize=14, fontweight='bold')
+                             fontsize=10, fontweight='bold')  # Reduced by 30%: 14 * 0.7 = 9.8 -> 10
             self.ax.text(0.5, 0.5, 'Step C not yet computed.\nClick "Next →" to compute and display.',
                         transform=self.ax.transAxes, ha='center', va='center',
-                        fontsize=12, bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+                        fontsize=8, bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))  # Reduced by 30%: 12 * 0.7 = 8.4 -> 8
             self.ax.set_xlim(0, 1)
             self.ax.set_ylim(0, 1)
             self.fig.canvas.draw_idle()
             return
         
         self.ax.set_title('Step C: Skeleton Extraction (Medial Axis)', 
-                         fontsize=14, fontweight='bold')
+                         fontsize=10, fontweight='bold')  # Reduced by 30%: 14 * 0.7 = 9.8 -> 10
         
         data = self.data.get('C', {})
         skeleton_graph = data.get('skeleton_graph')
@@ -335,7 +335,7 @@ class PipelineVisualizer:
                 Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', 
                       markersize=4, alpha=0.5, label='Intermediate (degree = 2)')
             ]
-            self.ax.legend(handles=legend_elements, loc='upper right', fontsize=9, 
+            self.ax.legend(handles=legend_elements, loc='upper right', fontsize=6,  # Reduced by 30%: 9 * 0.7 = 6.3 -> 6 
                           framealpha=0.9, edgecolor='black')
         
         # Set bounds
@@ -362,7 +362,7 @@ class PipelineVisualizer:
             info = f"Skeleton: {nodes_count} nodes, {edges_count} edges"
             self.ax.text(0.02, 0.98, info, transform=self.ax.transAxes,
                         verticalalignment='top', bbox=dict(boxstyle='round',
-                        facecolor='wheat', alpha=0.5), fontsize=10)
+                        facecolor='wheat', alpha=0.5), fontsize=7)  # Reduced by 30%: 10 * 0.7 = 7
         
         # Use draw_idle for better performance (batches redraws)
         self.fig.canvas.draw_idle()
@@ -374,17 +374,17 @@ class PipelineVisualizer:
         # Check if step is computed
         if 'C2' not in self.computed_steps:
             self.ax.set_title('Step C2: Endpoint Merging (Click Next to compute)', 
-                             fontsize=14, fontweight='bold')
+                             fontsize=10, fontweight='bold')  # Reduced by 30%: 14 * 0.7 = 9.8 -> 10
             self.ax.text(0.5, 0.5, 'Step C2 not yet computed.\nClick "Next →" to compute and display.',
                         transform=self.ax.transAxes, ha='center', va='center',
-                        fontsize=12, bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+                        fontsize=8, bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))  # Reduced by 30%: 12 * 0.7 = 8.4 -> 8
             self.ax.set_xlim(0, 1)
             self.ax.set_ylim(0, 1)
             self.fig.canvas.draw_idle()
             return
         
         self.ax.set_title('Step C2: Topology-Aware Endpoint Merging', 
-                         fontsize=14, fontweight='bold')
+                         fontsize=10, fontweight='bold')  # Reduced by 30%: 14 * 0.7 = 9.8 -> 10
         
         data = self.data.get('C2', {})
         skeleton_graph = data.get('skeleton_graph')
@@ -547,7 +547,7 @@ class PipelineVisualizer:
                 Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', 
                       markersize=4, alpha=0.5, label='Intermediate (degree = 2)')
             ]
-            self.ax.legend(handles=legend_elements, loc='upper right', fontsize=9, 
+            self.ax.legend(handles=legend_elements, loc='upper right', fontsize=6,  # Reduced by 30%: 9 * 0.7 = 6.3 -> 6 
                           framealpha=0.9, edgecolor='black')
         
         # Set bounds
@@ -574,7 +574,7 @@ class PipelineVisualizer:
             info = f"Junctions: {len(junction_clusters)} clusters ({junction_count} pixels), Endpoints: {len(endpoint_clusters)} clusters ({endpoint_count} pixels)"
             self.ax.text(0.02, 0.98, info, transform=self.ax.transAxes,
                         verticalalignment='top', bbox=dict(boxstyle='round',
-                        facecolor='wheat', alpha=0.5), fontsize=10)
+                        facecolor='wheat', alpha=0.5), fontsize=7)  # Reduced by 30%: 10 * 0.7 = 7
         
         # Use draw_idle for better performance (batches redraws)
         self.fig.canvas.draw_idle()
@@ -586,17 +586,17 @@ class PipelineVisualizer:
         # Check if step is computed
         if 'D' not in self.computed_steps:
             self.ax.set_title('Step D: Final Graph (Click Next to compute)', 
-                             fontsize=14, fontweight='bold')
+                             fontsize=10, fontweight='bold')  # Reduced by 30%: 14 * 0.7 = 9.8 -> 10
             self.ax.text(0.5, 0.5, 'Step D not yet computed.\nClick "Next →" to compute and display.',
                         transform=self.ax.transAxes, ha='center', va='center',
-                        fontsize=12, bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+                        fontsize=8, bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))  # Reduced by 30%: 12 * 0.7 = 8.4 -> 8
             self.ax.set_xlim(0, 1)
             self.ax.set_ylim(0, 1)
             self.fig.canvas.draw_idle()
             return
         
         self.ax.set_title('Step D: Final Graph (Nodes & Edges)', 
-                         fontsize=14, fontweight='bold')
+                         fontsize=10, fontweight='bold')  # Reduced by 30%: 14 * 0.7 = 9.8 -> 10
         
         data = self.data.get('D', {})
         nodes = data.get('nodes', [])
@@ -619,7 +619,9 @@ class PipelineVisualizer:
                 ys = [c[1] for c in coords]
                 self.ax.plot(xs, ys, 'b-', linewidth=2, alpha=0.7)
         
-        # Draw nodes with labels
+        # Draw nodes with labels - prevent text overlap
+        # Collect all node positions and labels first
+        node_positions = []
         for node in nodes:
             xy = node.get('xy', [0, 0])
             kind = node.get('kind', 'unknown')
@@ -638,8 +640,87 @@ class PipelineVisualizer:
             self.ax.plot(xy[0], xy[1], 'o', color=color, markersize=size,
                         markeredgecolor='black', markeredgewidth=1)
             
-            # Add label
-            self.ax.text(xy[0], xy[1], f" {node_id}", fontsize=9,
+            node_positions.append((xy[0], xy[1], node_id))
+        
+        # Helper to estimate text bounding box in data coordinates
+        def estimate_text_bbox(x, y, text, fontsize):
+            """Estimate text bounding box in data coordinates."""
+            # Rough estimate: fontsize points ≈ 0.01 * fontsize in data units (very approximate)
+            # This is a rough heuristic - actual size depends on axis limits
+            if polygon:
+                bounds = polygon.bounds
+                width_data = bounds[2] - bounds[0]
+                height_data = bounds[3] - bounds[1]
+            else:
+                # Fallback: use current axis limits
+                xlim = self.ax.get_xlim()
+                ylim = self.ax.get_ylim()
+                width_data = xlim[1] - xlim[0]
+                height_data = ylim[1] - ylim[0]
+            
+            # Estimate: fontsize 6 ≈ 0.5% of plot width/height
+            char_width = width_data * (fontsize / 1000.0) * len(text)
+            char_height = height_data * (fontsize / 1000.0) * 1.2
+            return (x, y, x + char_width, y + char_height)
+        
+        # Helper to check overlap
+        def bboxes_overlap(bbox1, bbox2, padding_factor=0.02):
+            """Check if two text bounding boxes overlap."""
+            x1_min, y1_min, x1_max, y1_max = bbox1
+            x2_min, y2_min, x2_max, y2_max = bbox2
+            
+            if polygon:
+                bounds = polygon.bounds
+                width_data = bounds[2] - bounds[0]
+                height_data = bounds[3] - bounds[1]
+            else:
+                xlim = self.ax.get_xlim()
+                ylim = self.ax.get_ylim()
+                width_data = xlim[1] - xlim[0]
+                height_data = ylim[1] - ylim[0]
+            
+            padding_x = width_data * padding_factor
+            padding_y = height_data * padding_factor
+            
+            return not (x1_max + padding_x < x2_min - padding_x or 
+                       x2_max + padding_x < x1_min - padding_x or
+                       y1_max + padding_y < y2_min - padding_y or
+                       y2_max + padding_y < y1_min - padding_y)
+        
+        # Draw labels with overlap prevention
+        label_fontsize = 6  # Reduced by 30%: 9 * 0.7 = 6.3 -> 6
+        text_bboxes = []
+        for x, y, node_id in node_positions:
+            label = f" {node_id}"
+            bbox = estimate_text_bbox(x, y, label, label_fontsize)
+            
+            # Check for overlaps and adjust position if needed
+            text_x, text_y = x, y
+            for existing_bbox in text_bboxes:
+                if bboxes_overlap(bbox, existing_bbox):
+                    # Try offset positions
+                    if polygon:
+                        bounds = polygon.bounds
+                        width_data = bounds[2] - bounds[0]
+                        height_data = bounds[3] - bounds[1]
+                    else:
+                        xlim = self.ax.get_xlim()
+                        ylim = self.ax.get_ylim()
+                        width_data = xlim[1] - xlim[0]
+                        height_data = ylim[1] - ylim[0]
+                    
+                    offset = max(width_data, height_data) * 0.01  # 1% of plot size
+                    # Try right, above, left, below
+                    for dx, dy in [(offset, 0), (0, offset), (-offset, 0), (0, -offset)]:
+                        new_bbox = estimate_text_bbox(x + dx, y + dy, label, label_fontsize)
+                        if not any(bboxes_overlap(new_bbox, existing_bbox) for existing_bbox in text_bboxes):
+                            text_x, text_y = x + dx, y + dy
+                            bbox = new_bbox
+                            break
+                    break
+            
+            text_bboxes.append(bbox)
+            self.ax.text(text_x, text_y, label, fontsize=label_fontsize,
                         verticalalignment='bottom', fontweight='bold')
         
         # Set bounds
@@ -678,7 +759,7 @@ class PipelineVisualizer:
         info = f"Nodes: {len(nodes)}, Edges: {len(edges)}"
         self.ax.text(0.02, 0.98, info, transform=self.ax.transAxes,
                     verticalalignment='top', bbox=dict(boxstyle='round',
-                    facecolor='wheat', alpha=0.5), fontsize=10)
+                    facecolor='wheat', alpha=0.5), fontsize=7)  # Reduced by 30%: 10 * 0.7 = 7
     
     def _update_display(self):
         """Update the display based on current step."""
@@ -693,10 +774,10 @@ class PipelineVisualizer:
         if not self.enabled_steps.get(step_name, False):
             # Show disabled message
             self.ax.cla()  # Faster than clear() - doesn't reset all properties
-            self.ax.set_title(f'Step {step_name}: Disabled', fontsize=14, fontweight='bold')
+            self.ax.set_title(f'Step {step_name}: Disabled', fontsize=10, fontweight='bold')  # Reduced by 30%: 14 * 0.7 = 9.8 -> 10
             self.ax.text(0.5, 0.5, f'Step {step_name} is disabled.',
                         transform=self.ax.transAxes, ha='center', va='center',
-                        fontsize=12, bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+                        fontsize=8, bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))  # Reduced by 30%: 12 * 0.7 = 8.4 -> 8
             self.ax.set_xlim(0, 1)
             self.ax.set_ylim(0, 1)
             self.fig.canvas.draw_idle()
@@ -1011,7 +1092,9 @@ class PipelineVisualizer:
                 per_edge_overrides=self.compute_params.get('per_edge_overrides'),
                 simplify_tolerance_factor=self.compute_params.get('simplify_tolerance_factor', 0.5),
                 endpoint_merge_distance_factor=self.compute_params.get('endpoint_merge_distance_factor', 1.0),
-                e_Ramer_Douglas_Peucker=self.compute_params.get('e_Ramer_Douglas_Peucker', 10.0)
+                e_Ramer_Douglas_Peucker=self.compute_params.get('e_Ramer_Douglas_Peucker', 10.0),
+                min_leg_corner_detection=self.compute_params.get('min_leg_corner_detection'),
+                hv_transition_px=self.compute_params.get('hv_transition_px', False)
             )
             t1 = time.time()
             print(f"  [Step D] Extract full graph: {t1 - t0:.3f}s")

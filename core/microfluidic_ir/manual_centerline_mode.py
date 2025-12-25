@@ -163,7 +163,7 @@ class ManualCenterlineMode:
             logger.error(f"Failed to save centerlines: {e}")
             return False
     
-    def _estimate_text_box_size(self, text: str, fontsize: int = 8) -> Tuple[float, float]:
+    def _estimate_text_box_size(self, text: str, fontsize: int = 6) -> Tuple[float, float]:  # Reduced by 30%: 8 * 0.7 = 5.6 -> 6
         """
         Estimate text bounding box size in data coordinates (mm).
         
@@ -777,11 +777,11 @@ class ManualCenterlineMode:
         self.ax.set_ylim(ylim_mm)
         
         # Adjust label positions to avoid overlaps (already in mm)
-        adjusted_positions = self._adjust_label_positions(label_positions, fontsize=8)
+        adjusted_positions = self._adjust_label_positions(label_positions, fontsize=6)  # Reduced by 30%: 8 * 0.7 = 5.6 -> 6
         
         # Draw labels with adjusted positions (already in mm)
         for x, y, segment_id in adjusted_positions:
-            self.ax.text(x, y, segment_id, fontsize=8,
+            self.ax.text(x, y, segment_id, fontsize=6,  # Reduced by 30%: 8 * 0.7 = 5.6 -> 6
                         ha='center', va='center',
                         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
         
@@ -801,7 +801,7 @@ class ManualCenterlineMode:
         self.ax.set_xlabel('X (mm)')
         self.ax.set_ylabel('Y (mm)')
         self.ax.set_title('Manual Centerline Mode - Click 2 boundary segments, press Enter', 
-                         fontsize=12, fontweight='bold')
+                         fontsize=8, fontweight='bold')  # Reduced by 30%: 12 * 0.7 = 8.4 -> 8
         
         # Status overlay
         selected_text = f"Selected: {self.selected_segments[0] or 'None'}, {self.selected_segments[1] or 'None'}"
@@ -810,13 +810,13 @@ class ManualCenterlineMode:
         
         status_text = f"{selected_text} | {count_text} | {save_text}"
         self.ax.text(0.02, 0.98, status_text, transform=self.ax.transAxes,
-                    verticalalignment='top', fontsize=9,
+                    verticalalignment='top', fontsize=6,  # Reduced by 30%: 9 * 0.7 = 6.3 -> 6
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
         # Instructions
         instructions = "Click 2 segments → Enter | Backspace: Undo | Escape: Reset"
         self.ax.text(0.5, 0.02, instructions, transform=self.ax.transAxes,
-                    ha='center', fontsize=9,
+                    ha='center', fontsize=6,  # Reduced by 30%: 9 * 0.7 = 6.3 -> 6
                     bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
         
         # Update pairs list and delete all button
@@ -866,7 +866,7 @@ class ManualCenterlineMode:
             pairs_text = "\n".join(pairs_lines)
             self.pairs_text = self.pairs_ax.text(0.05, 0.95, pairs_text, 
                                            transform=self.pairs_ax.transAxes,
-                                           fontsize=9, verticalalignment='top',
+                                           fontsize=6, verticalalignment='top',  # Reduced by 30%: 9 * 0.7 = 6.3 -> 6
                                            family='monospace',
                                            bbox=dict(boxstyle='round', 
                                                     facecolor='lightgray', 
@@ -876,7 +876,7 @@ class ManualCenterlineMode:
             pairs_text = "Line Pairs:\n" + "=" * 25 + "\n(No pairs yet)"
             self.pairs_text = self.pairs_ax.text(0.05, 0.95, pairs_text, 
                                            transform=self.pairs_ax.transAxes,
-                                           fontsize=9, verticalalignment='top',
+                                           fontsize=6, verticalalignment='top',  # Reduced by 30%: 9 * 0.7 = 6.3 -> 6
                                            family='monospace',
                                            bbox=dict(boxstyle='round', 
                                                     facecolor='lightgray', 

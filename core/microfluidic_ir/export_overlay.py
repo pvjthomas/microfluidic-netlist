@@ -90,7 +90,7 @@ def export_overlay_png(
     node_color: Tuple[int, int, int] = (255, 0, 0),
     port_color: Tuple[int, int, int] = (0, 255, 0),
     label_color: Tuple[int, int, int] = (0, 0, 0),
-    font_size: int = 12
+    font_size: int = 8  # Reduced by 30%: 12 * 0.7 = 8.4 -> 8
 ) -> None:
     """
     Export tagged overlay image as PNG.
@@ -173,6 +173,49 @@ def export_overlay_png(
         # Draw centerline
         draw.line(img_coords, fill=centerline_color, width=2)
     
+    # Helper function to check if two text bounding boxes overlap
+    def text_bboxes_overlap(bbox1, bbox2, padding=3):
+        """Check if two text bounding boxes overlap with padding."""
+        x1_min, y1_min, x1_max, y1_max = bbox1
+        x2_min, y2_min, x2_max, y2_max = bbox2
+        return not (x1_max + padding < x2_min - padding or 
+                   x2_max + padding < x1_min - padding or
+                   y1_max + padding < y2_min - padding or
+                   y2_max + padding < y1_min - padding)
+    
+    # Helper function to adjust text position to avoid overlaps
+    def adjust_text_position(text_x, text_y, text_width, text_height, existing_bboxes, image_width, image_height, padding=3):
+        """Adjust text position to avoid overlaps with existing text."""
+        bbox = (text_x, text_y, text_x + text_width, text_y + text_height)
+        overlaps = any(text_bboxes_overlap(bbox, existing_bbox, padding) for existing_bbox in existing_bboxes)
+        
+        if not overlaps:
+            return text_x, text_y, bbox
+        
+        # Try positions around the original (spiral search)
+        offsets = [
+            (0, -text_height - padding),  # Above
+            (text_width + padding, 0),    # Right
+            (0, text_height + padding),    # Below
+            (-text_width - padding, 0),   # Left
+        ]
+        
+        for offset_x, offset_y in offsets:
+            new_x = text_x + offset_x
+            new_y = text_y + offset_y
+            new_x = max(0, min(new_x, image_width - text_width))
+            new_y = max(0, min(new_y, image_height - text_height))
+            
+            bbox = (new_x, new_y, new_x + text_width, new_y + text_height)
+            overlaps = any(text_bboxes_overlap(bbox, existing_bbox, padding) for existing_bbox in existing_bboxes)
+            if not overlaps:
+                return new_x, new_y, bbox
+        
+        return text_x, text_y, bbox
+    
+    # Track text bounding boxes to prevent overlaps
+    text_bboxes = []
+    
     # Draw nodes
     node_radius = max(3, int(5 / um_per_px))  # ~5 µm radius
     for node in nodes:
@@ -182,11 +225,23 @@ def export_overlay_png(
         bbox = [x - node_radius, y - node_radius, x + node_radius, y + node_radius]
         draw.ellipse(bbox, fill=node_color, outline=(0, 0, 0))
         
-        # Draw node label
+        # Draw node label with overlap prevention
         label = node['id']
-        # Offset label slightly to avoid overlap with node
-        text_x = x + node_radius + 3
-        text_y = y - font_size // 2
+        char_width = font_size * 0.6
+        text_width = int(len(label) * char_width)
+        text_height = font_size
+        
+        # Initial position
+        text_x = x + node_radius + 2  # Reduced offset
+        text_y = y - text_height // 2
+        
+        # Adjust position to avoid overlaps
+        text_x, text_y, text_bbox = adjust_text_position(
+            text_x, text_y, text_width, text_height,
+            text_bboxes, image_width, image_height, padding=3
+        )
+        text_bboxes.append(text_bbox)
+        
         draw.text((text_x, text_y), label, fill=label_color, font=font)
     
     # Draw edge labels at midpoints
@@ -214,10 +269,22 @@ def export_overlay_png(
         
         # Center the text on the midpoint
         # Get approximate text size (rough estimate)
-        text_width = len(label) * font_size * 0.6  # Approximate character width
+        char_width = font_size * 0.6
+        text_width = int(len(label) * char_width)
         text_height = font_size
         text_x -= int(text_width / 2)
         text_y -= int(text_height / 2)
+        
+        # Clamp to image bounds
+        text_x = max(0, min(text_x, image_width - text_width))
+        text_y = max(0, min(text_y, image_height - text_height))
+        
+        # Adjust position to avoid overlaps
+        text_x, text_y, text_bbox = adjust_text_position(
+            text_x, text_y, text_width, text_height,
+            text_bboxes, image_width, image_height, padding=3
+        )
+        text_bboxes.append(text_bbox)
         
         draw.text((text_x, text_y), label, fill=label_color, font=font)
     
@@ -236,14 +303,26 @@ def export_overlay_png(
             bbox = [cx - radius_px, cy - radius_px, cx + radius_px, cy + radius_px]
             draw.ellipse(bbox, outline=port_color, width=2)
             
-            # Draw port label
+            # Draw port label with overlap prevention
             label = port.get('label', port['port_id'])
             if not label:
                 label = port['port_id']
             
-            # Offset label outside circle
-            text_x = cx + radius_px + 3
-            text_y = cy - font_size // 2
+            char_width = font_size * 0.6
+            text_width = int(len(label) * char_width)
+            text_height = font_size
+            
+            # Initial position
+            text_x = cx + radius_px + 2  # Reduced offset
+            text_y = cy - text_height // 2
+            
+            # Adjust position to avoid overlaps
+            text_x, text_y, text_bbox = adjust_text_position(
+                text_x, text_y, text_width, text_height,
+                text_bboxes, image_width, image_height, padding=3
+            )
+            text_bboxes.append(text_bbox)
+            
             draw.text((text_x, text_y), label, fill=label_color, font=font)
     
     # Save image

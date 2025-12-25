@@ -353,6 +353,22 @@ def run_pipeline(
     else:
         logger.debug(f"Using default e_Ramer_Douglas_Peucker={e_rdp:.1f} µm")
     
+    # Load min_leg_corner_detection from param file or use default (minimum_channel_width)
+    min_leg_corner_detection = None  # Will default to minimum_channel_width if not provided
+    if 'min_leg_corner_detection' in param_file_params:
+        min_leg_corner_detection = param_file_params['min_leg_corner_detection']
+        logger.info(f"Using min_leg_corner_detection from param file: {min_leg_corner_detection} µm")
+    else:
+        logger.debug(f"Using default min_leg_corner_detection=minimum_channel_width ({minimum_channel_width:.1f} µm)")
+    
+    # Load hv_transition_px from param file or use default (False)
+    hv_transition_px = False  # Default: False (H↔V detector disabled)
+    if 'hv_transition_px' in param_file_params:
+        hv_transition_px = bool(param_file_params['hv_transition_px'])
+        logger.info(f"Using hv_transition_px from param file: {hv_transition_px}")
+    else:
+        logger.debug(f"Using default hv_transition_px=False (H↔V transition detector disabled)")
+    
     # Compute width_sample_step from minimum_channel_width if not provided
     if width_sample_step is None:
         width_sample_step = minimum_channel_width / 3.0
@@ -530,7 +546,9 @@ def run_pipeline(
                 debug_output_dir=debug_output_dir,
                 L_spur_cutoff=L_spur_cutoff,
                 corner_spur_cutoff=corner_spur_cutoff,
-                e_Ramer_Douglas_Peucker=e_rdp
+                e_Ramer_Douglas_Peucker=e_rdp,
+                min_leg_corner_detection=min_leg_corner_detection,
+                hv_transition_px=hv_transition_px
             )
             step_cd_time = time.time() - step_cd_start
             logger.info(f"Steps C & D: Completed in {step_cd_time:.2f}s")
@@ -583,7 +601,9 @@ def run_pipeline(
                     per_edge_overrides=per_edge_overrides,
                     simplify_tolerance_factor=simplify_tolerance_factor,
                     endpoint_merge_distance_factor=endpoint_merge_distance_factor,
-                    e_Ramer_Douglas_Peucker=e_rdp
+                    e_Ramer_Douglas_Peucker=e_rdp,
+                    min_leg_corner_detection=min_leg_corner_detection,
+                    hv_transition_px=hv_transition_px
                 )
             
             enabled_list = [step for step, enabled in visualizer.enabled_steps.items() if enabled]

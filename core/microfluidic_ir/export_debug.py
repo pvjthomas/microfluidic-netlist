@@ -190,14 +190,66 @@ def export_debug_image(
     img = Image.new('RGB', (image_width, image_height), (255, 255, 255))
     draw = ImageDraw.Draw(img)
     
-    # Try to load a font (4x larger: 10 -> 40)
+    # Font size reduced by 30%: 40 -> 28 (40 * 0.7 = 28)
+    base_font_size = int(40 * 0.7)  # 28
     try:
-        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 40)
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", base_font_size)
     except:
         try:
-            font = ImageFont.truetype("arial.ttf", 40)
+            font = ImageFont.truetype("arial.ttf", base_font_size)
         except:
             font = ImageFont.load_default()
+    
+    # Helper function to check if two text bounding boxes overlap
+    def text_bboxes_overlap(bbox1, bbox2, padding=5):
+        """Check if two text bounding boxes overlap with padding."""
+        x1_min, y1_min, x1_max, y1_max = bbox1
+        x2_min, y2_min, x2_max, y2_max = bbox2
+        # Add padding
+        return not (x1_max + padding < x2_min - padding or 
+                   x2_max + padding < x1_min - padding or
+                   y1_max + padding < y2_min - padding or
+                   y2_max + padding < y1_min - padding)
+    
+    # Helper function to adjust text position to avoid overlaps
+    def adjust_text_position(text_x, text_y, text_width, text_height, existing_bboxes, image_width, image_height, padding=5):
+        """Adjust text position to avoid overlaps with existing text."""
+        # Try original position first
+        bbox = (text_x, text_y, text_x + text_width, text_y + text_height)
+        overlaps = any(text_bboxes_overlap(bbox, existing_bbox, padding) for existing_bbox in existing_bboxes)
+        
+        if not overlaps:
+            return text_x, text_y, bbox
+        
+        # Try positions around the original (spiral search)
+        offsets = [
+            (0, -text_height - padding),  # Above
+            (text_width + padding, 0),    # Right
+            (0, text_height + padding),    # Below
+            (-text_width - padding, 0),   # Left
+            (text_width + padding, -text_height - padding),  # Above-right
+            (-text_width - padding, -text_height - padding), # Above-left
+            (text_width + padding, text_height + padding),    # Below-right
+            (-text_width - padding, text_height + padding),   # Below-left
+        ]
+        
+        for offset_x, offset_y in offsets:
+            new_x = text_x + offset_x
+            new_y = text_y + offset_y
+            # Clamp to image bounds
+            new_x = max(0, min(new_x, image_width - text_width))
+            new_y = max(0, min(new_y, image_height - text_height))
+            
+            bbox = (new_x, new_y, new_x + text_width, new_y + text_height)
+            overlaps = any(text_bboxes_overlap(bbox, existing_bbox, padding) for existing_bbox in existing_bboxes)
+            if not overlaps:
+                return new_x, new_y, bbox
+        
+        # If all positions overlap, return original (will overlap but at least visible)
+        return text_x, text_y, bbox
+    
+    # Track text bounding boxes to prevent overlaps
+    text_bboxes = []
     
     # Draw Shapely polygon with holes (if provided)
     if polygon is not None:
@@ -320,12 +372,24 @@ def export_debug_image(
             if bbox[2] > bbox[0] and bbox[3] > bbox[1]:  # Valid bbox
                 draw.ellipse(bbox, fill=color, outline=outline, width=8)  # 4x: 2 -> 8
             
-            # Draw node label - 4x offset, clamp to image bounds with margin for text
-            # Estimate text size: ~40px font means roughly 40px per character
+            # Draw node label - reduced font size by 30%
+            # Estimate text size: base_font_size per character (reduced by 30%)
             label = node.get('id', '?')
-            estimated_text_width = len(label) * 40
-            text_x = max(0, min(x + node_radius + 8, image_width - estimated_text_width - 1))  # 4x: 2 -> 8
-            text_y = max(40, min(y - 20, image_height - 40 - 1))  # 4x: 5 -> 20, margin for font height
+            char_width = base_font_size * 0.6  # Approximate character width
+            estimated_text_width = int(len(label) * char_width)
+            estimated_text_height = base_font_size
+            
+            # Initial position
+            text_x = max(0, min(x + node_radius + 6, image_width - estimated_text_width - 1))
+            text_y = max(0, min(y - estimated_text_height // 2, image_height - estimated_text_height - 1))
+            
+            # Adjust position to avoid overlaps
+            text_x, text_y, bbox = adjust_text_position(
+                text_x, text_y, estimated_text_width, estimated_text_height,
+                text_bboxes, image_width, image_height, padding=5
+            )
+            text_bboxes.append(bbox)
+            
             try:
                 draw.text((text_x, text_y), label, fill=(0, 0, 0), font=font)
             except Exception:
@@ -347,29 +411,44 @@ def export_debug_image(
             # Draw centerline in blue
             draw.line(img_coords, fill=(0, 100, 200), width=2)
             
-            # Draw edge label at midpoint - 4x larger text, clamp to image bounds
+            # Draw edge label at midpoint - reduced font size by 30%
             if len(coords) >= 2:
                 midpoint_idx = len(coords) // 2
                 mid_coord = coords[midpoint_idx]
                 mx, my = clamp_coord(*world_to_image(mid_coord[0], mid_coord[1], xmin, ymin, um_per_px), image_width, image_height)
                 label = edge.get('id', '?')
-                # Clamp text position to ensure it's within image with margin for text
-                estimated_text_width = len(label) * 40
-                text_x = max(0, min(mx, image_width - estimated_text_width - 1))
-                text_y = max(40, min(my, image_height - 40 - 1))
+                
+                # Estimate text size (reduced by 30%)
+                char_width = base_font_size * 0.6
+                estimated_text_width = int(len(label) * char_width)
+                estimated_text_height = base_font_size
+                
+                # Center text on midpoint
+                text_x = max(0, min(mx - estimated_text_width // 2, image_width - estimated_text_width - 1))
+                text_y = max(0, min(my - estimated_text_height // 2, image_height - estimated_text_height - 1))
+                
+                # Adjust position to avoid overlaps
+                text_x, text_y, bbox = adjust_text_position(
+                    text_x, text_y, estimated_text_width, estimated_text_height,
+                    text_bboxes, image_width, image_height, padding=5
+                )
+                text_bboxes.append(bbox)
+                
                 try:
                     draw.text((text_x, text_y), label, fill=(0, 0, 0), font=font)
                 except Exception:
                     # If text drawing fails, skip it
                     pass
     
-    # Add title text - 4x larger, ensure within bounds with margin
+    # Add title text - reduced font size by 30%
     title = f"Step {step_name}"
-    estimated_title_width = len(title) * 40
-    title_x = max(0, min(40, image_width - estimated_title_width - 1))
-    title_y = max(0, min(40, image_height - 40 - 1))
+    char_width = base_font_size * 0.6
+    estimated_title_width = int(len(title) * char_width)
+    estimated_title_height = base_font_size
+    title_x = max(0, min(28, image_width - estimated_title_width - 1))  # Reduced: 40 -> 28
+    title_y = max(0, min(28, image_height - estimated_title_height - 1))  # Reduced: 40 -> 28
     try:
-        draw.text((title_x, title_y), title, fill=(0, 0, 0), font=font)  # 4x: 10 -> 40
+        draw.text((title_x, title_y), title, fill=(0, 0, 0), font=font)
     except Exception:
         # If title drawing fails, skip it
         pass

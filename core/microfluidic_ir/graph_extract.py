@@ -761,8 +761,10 @@ def re_center_junctions(
 def split_edge_at_corners(
     centerline_coords: List[Tuple[float, float]],
     um_per_px: float,
+    minimum_channel_width: float,
     turn_thresh_deg: float = 30.0,
-    min_leg: float = None
+    min_leg: float = None,
+    hv_transition_px: bool = False
 ) -> List[int]:
     """
     Detect corner points on a polyline using direction-change (H↔V) or turning angle threshold.
@@ -770,8 +772,12 @@ def split_edge_at_corners(
     Args:
         centerline_coords: List of (x, y) coordinates
         um_per_px: Resolution in microns per pixel
+        minimum_channel_width: Minimum channel width in micrometers (used as default for min_leg)
         turn_thresh_deg: Minimum turning angle in degrees to consider a corner (default: 30.0)
-        min_leg: Minimum leg length in µm between corners (default: 2*um_per_px)
+        min_leg: Minimum leg length in µm between corners (default: minimum_channel_width)
+                Can be overridden from FILENAME_param.txt file
+        hv_transition_px: If True, enable H↔V (horizontal-vertical) transition detector (default: False)
+                         Can be set via FILENAME_param.txt file
         
     Returns:
         List of indices where corners are detected (including first and last indices)
@@ -783,7 +789,7 @@ def split_edge_at_corners(
         return [0, len(centerline_coords) - 1] if len(centerline_coords) >= 2 else [0]
     
     if min_leg is None:
-        min_leg = 2.0 * um_per_px
+        min_leg = minimum_channel_width  # Default: minimum_channel_width in µm
     
     turn_thresh_rad = math.radians(turn_thresh_deg)
     
@@ -808,21 +814,24 @@ def split_edge_at_corners(
         if len1 < 1e-10 or len2 < 1e-10:
             continue  # Degenerate edge, skip
         
-        # Check for horizontal/vertical direction change (H↔V)
         # Normalize to unit vectors
         vec1_x /= len1
         vec1_y /= len1
         vec2_x /= len2
         vec2_y /= len2
         
-        # Check if directions are approximately horizontal or vertical
-        is_h1 = abs(vec1_y) < 0.1  # Approximately horizontal
-        is_v1 = abs(vec1_x) < 0.1  # Approximately vertical
-        is_h2 = abs(vec2_y) < 0.1
-        is_v2 = abs(vec2_x) < 0.1
-        
-        # H↔V transition
-        hv_transition = (is_h1 and is_v2) or (is_v1 and is_h2)
+        # H↔V transition detector (only if enabled via hv_transition_px parameter)
+        hv_transition = False
+        if hv_transition_px:
+            # Check for horizontal/vertical direction change (H↔V)
+            # Check if directions are approximately horizontal or vertical
+            is_h1 = abs(vec1_y) < 0.1  # Approximately horizontal
+            is_v1 = abs(vec1_x) < 0.1  # Approximately vertical
+            is_h2 = abs(vec2_y) < 0.1
+            is_v2 = abs(vec2_x) < 0.1
+            
+            # H↔V transition
+            hv_transition = (is_h1 and is_v2) or (is_v1 and is_h2)
         
         # Compute turning angle
         # angle = acos(dot_product) gives:
@@ -1134,7 +1143,9 @@ def extract_graph_from_polygon(
     debug_output_dir: Optional[str] = None,
     L_spur_cutoff: Optional[float] = None,
     corner_spur_cutoff: Optional[float] = None,
-    e_Ramer_Douglas_Peucker: float = 10.0
+    e_Ramer_Douglas_Peucker: float = 10.0,
+    min_leg_corner_detection: Optional[float] = None,
+    hv_transition_px: bool = False
 ) -> Dict[str, Any]:
     """
     Extract network graph from a polygon.
@@ -1152,6 +1163,8 @@ def extract_graph_from_polygon(
         simplify_tolerance_factor: Factor to multiply minimum_channel_width for simplify_tolerance (default: 0.5)
         endpoint_merge_distance_factor: Factor to multiply minimum_channel_width for endpoint merge distance (default: 1.0)
         e_Ramer_Douglas_Peucker: Epsilon parameter for Ramer-Douglas-Peucker simplification before corner detection (default: 10.0 µm)
+        min_leg_corner_detection: Minimum leg length in µm between corners (default: minimum_channel_width, can be set via FILENAME_param.txt)
+        hv_transition_px: If True, enable H↔V (horizontal-vertical) transition detector for corner detection (default: False, can be set via FILENAME_param.txt)
     
     Returns:
         Dictionary with:
@@ -1164,6 +1177,11 @@ def extract_graph_from_polygon(
     if width_sample_step is None:
         width_sample_step = minimum_channel_width / 3.0
         logger.debug(f"Computed width_sample_step={width_sample_step:.1f} µm from minimum_channel_width={minimum_channel_width:.1f} µm")
+    
+    # Set min_leg_corner_detection default to minimum_channel_width if not provided
+    if min_leg_corner_detection is None:
+        min_leg_corner_detection = minimum_channel_width
+        logger.debug(f"Using default min_leg_corner_detection={min_leg_corner_detection:.1f} µm (minimum_channel_width)")
     
     # Skeletonize polygon
     logger.info("Building graph from skeleton")
@@ -1593,7 +1611,14 @@ def extract_graph_from_polygon(
             except Exception as e:
                 logger.warning(f"Failed to apply RDP simplification to edge {edge['id']}: {e}, using original")
         
-        corner_indices = split_edge_at_corners(centerline_coords, um_per_px, turn_thresh_deg=30.0)
+        corner_indices = split_edge_at_corners(
+            centerline_coords, 
+            um_per_px, 
+            minimum_channel_width,
+            turn_thresh_deg=30.0,
+            min_leg=min_leg_corner_detection,
+            hv_transition_px=hv_transition_px
+        )
         
         # Dedupe and sort corner indices before use
         corner_indices = sorted(set(corner_indices))
@@ -2185,7 +2210,9 @@ def extract_graph_from_polygons(
     debug_output_dir: Optional[str] = None,
     L_spur_cutoff: Optional[float] = None,
     corner_spur_cutoff: Optional[float] = None,
-    e_Ramer_Douglas_Peucker: float = 10.0
+    e_Ramer_Douglas_Peucker: float = 10.0,
+    min_leg_corner_detection: Optional[float] = None,
+    hv_transition_px: bool = False
 ) -> Dict[str, Any]:
     """
     Extract network graph from multiple polygons (union first) and optionally detect ports.
@@ -2271,7 +2298,9 @@ def extract_graph_from_polygons(
         debug_output_dir=debug_output_dir,
         L_spur_cutoff=L_spur_cutoff,
         corner_spur_cutoff=corner_spur_cutoff,
-        e_Ramer_Douglas_Peucker=e_Ramer_Douglas_Peucker
+        e_Ramer_Douglas_Peucker=e_Ramer_Douglas_Peucker,
+        min_leg_corner_detection=min_leg_corner_detection,
+        hv_transition_px=hv_transition_px
     )
     
     # Optionally detect ports
