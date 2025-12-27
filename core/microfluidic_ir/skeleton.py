@@ -362,7 +362,8 @@ def skeletonize_polygon(
     um_per_px: float,
     L_spur_cutoff: float,
     simplify_tolerance: Optional[float] = None,
-    corner_spur_cutoff: Optional[float] = None
+    corner_spur_cutoff: Optional[float] = None,
+    distance_field: Optional[Dict[str, Any]] = None
 ) -> Tuple[nx.Graph, Dict[str, Any]]:
     """
     Skeletonize a polygon and convert to a NetworkX graph.
@@ -732,6 +733,23 @@ def skeletonize_polygon(
     logger.debug("skeletonize_polygon: building NetworkX graph from skeleton")
     G = nx.Graph()
     
+    # Helper to get radius/width from distance field
+    def get_node_radius_width(x: float, y: float) -> Tuple[float, float]:
+        """Get radius and width at coordinate from distance field."""
+        if distance_field is None:
+            return 0.0, 0.0
+        try:
+            from .geometry import get_distance_at_coordinate
+            dist_array = distance_field.get('dist')
+            transform_dict = distance_field.get('transform')
+            if dist_array is not None and transform_dict is not None:
+                radius = get_distance_at_coordinate(x, y, dist_array, transform_dict)
+                width = 2.0 * radius
+                return radius, width
+        except Exception as e:
+            logger.debug(f"Failed to get radius/width at ({x}, {y}): {e}")
+        return 0.0, 0.0
+    
     # Add all skeleton pixels as nodes
     logger.debug("skeletonize_polygon: adding %d nodes to graph", len(skeleton_pixels))
     start = time.time()
@@ -745,7 +763,11 @@ def skeletonize_polygon(
             inverted_row = img_height - 1 - row
             coords = pixel_to_coords((inverted_row, col), transform)
             node_id = i
-            G.add_node(node_id, xy=coords)
+            
+            # Get radius and width from distance field
+            radius, width = get_node_radius_width(coords[0], coords[1])
+            
+            G.add_node(node_id, xy=coords, radius=radius, width=width, x=coords[0], y=coords[1])
             pixel_to_node[tuple(pixel)] = node_id
         node_time = time.time() - start
         logger.info(f"  Adding nodes: {node_time:.2f}s")

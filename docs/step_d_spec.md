@@ -142,6 +142,14 @@ Step D is the final graph extraction phase that converts the pixel-based skeleto
        5. Final refinement passes with stabilized normals
      - Validation: If refined length > 2× original length, use original (avoid artifacts)
    - If refinement fails or path is short (≤50 µm), use skeleton coordinates directly
+   
+   **Note: Smoothed Tangent-Based Corner Detection** (future enhancement):
+   - Implement corner detection using smoothed tangents computed from neighboring points
+   - For each point i in the centerline, compute tangent using either:
+     - `i+k, i-k` (symmetric window with configurable k)
+     - `i+1, i-1` (immediate neighbors, simpler case)
+   - Detect corners by identifying significant changes in tangent direction
+   - Use corner points for: improved edge segmentation, junction detection refinement, or adaptive smoothing
 
 3. **Node Position Update**:
    - Update `node1['xy']` to match refined centerline start point

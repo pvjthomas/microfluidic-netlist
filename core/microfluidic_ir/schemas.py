@@ -27,6 +27,7 @@ class Node(BaseModel):
     kind: Literal["junction", "endpoint", "port"]
     label: str
     port: Optional[Dict[str, Any]] = None
+    distance: Optional[float] = None  # Local half-width (distance to boundary) at node location
 
 
 class Edge(BaseModel):
@@ -61,4 +62,33 @@ class GraphIR(BaseModel):
     nodes: List[Node]
     edges: List[Edge]
     ports: List[Port]
+
+
+# Pixel-level graph schemas
+class PixelNode(BaseModel):
+    """Node in raw pixel graph G_px."""
+    radius: float  # Local half-width (distance to boundary) from distance field
+    width: float  # 2 * radius
+    x: Optional[float] = None  # World x coordinate (optional)
+    y: Optional[float] = None  # World y coordinate (optional)
+
+
+class PixelEdge(BaseModel):
+    """Edge in raw pixel graph G_px."""
+    length: float  # Length in world units
+    cost: Optional[float] = None  # Optional path cost
+
+
+# Branch-level schemas
+class BranchEdge(BaseModel):
+    """Edge in reduced branch graph G_br (represents a branch between terminals)."""
+    length: float
+    mean_width: float
+    min_width: float
+    max_width: float
+    width_std: float
+    slenderness: float  # length / mean_width
+    polyline: List[List[float]]  # List of [x, y] coordinates
+    u_terminal_type: Literal["endpoint", "junction"]  # Type of terminal at u
+    v_terminal_type: Literal["endpoint", "junction"]  # Type of terminal at v
 

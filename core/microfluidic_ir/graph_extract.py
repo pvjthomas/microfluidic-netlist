@@ -21,6 +21,7 @@ from .measure import measure_edge
 from .classify import classify_width_profile
 from .ports import detect_ports
 from .cross_section import apply_cross_section_defaults
+from .geometry import get_distance_at_coordinate
 import logging
 
 logger = logging.getLogger(__name__)
@@ -1145,7 +1146,8 @@ def extract_graph_from_polygon(
     corner_spur_cutoff: Optional[float] = None,
     e_Ramer_Douglas_Peucker: float = 10.0,
     min_leg_corner_detection: Optional[float] = None,
-    hv_transition_px: bool = False
+    hv_transition_px: bool = False,
+    distance_field: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Extract network graph from a polygon.
@@ -1165,14 +1167,29 @@ def extract_graph_from_polygon(
         e_Ramer_Douglas_Peucker: Epsilon parameter for Ramer-Douglas-Peucker simplification before corner detection (default: 10.0 µm)
         min_leg_corner_detection: Minimum leg length in µm between corners (default: minimum_channel_width, can be set via FILENAME_param.txt)
         hv_transition_px: If True, enable H↔V (horizontal-vertical) transition detector for corner detection (default: False, can be set via FILENAME_param.txt)
+        distance_field: Optional dict with distance field data ('dist', 'transform' keys) from local_scale_field
     
     Returns:
         Dictionary with:
-        - nodes: List of node dicts (id, xy, kind, degree)
+        - nodes: List of node dicts (id, xy, kind, degree, distance)
         - edges: List of edge dicts (id, u, v, centerline, length, width_profile, cross_section)
         - skeleton_graph: NetworkX graph (for debugging)
         - transform: Transform dictionary with um_per_px
     """
+    # Helper function to get distance at a coordinate
+    def get_node_distance(x: float, y: float) -> Optional[float]:
+        """Get distance value at node coordinate from distance field."""
+        if distance_field is None:
+            return None
+        try:
+            dist_array = distance_field.get('dist')
+            transform_dict = distance_field.get('transform')
+            if dist_array is not None and transform_dict is not None:
+                return get_distance_at_coordinate(x, y, dist_array, transform_dict)
+        except Exception as e:
+            logger.debug(f"Failed to get distance at ({x}, {y}): {e}")
+        return None
+    
     # Compute width_sample_step from minimum_channel_width if not provided
     if width_sample_step is None:
         width_sample_step = minimum_channel_width / 3.0
@@ -1200,7 +1217,8 @@ def extract_graph_from_polygon(
         um_per_px=um_per_px,
         L_spur_cutoff=L_spur_cutoff,
         simplify_tolerance=simplify_tolerance,
-        corner_spur_cutoff=corner_spur_cutoff
+        corner_spur_cutoff=corner_spur_cutoff,
+        distance_field=distance_field
     )
     
     # Export debug image: C_skeleton (after skeletonization)
@@ -1375,12 +1393,16 @@ def extract_graph_from_polygon(
         cluster_to_node_id[('junction', cluster_id)] = true_node_idx
         skeleton_node_to_true_node[rep_node] = true_node_idx
         
+        # Get distance value at node location
+        node_distance = get_node_distance(xy[0], xy[1])
+        
         nodes.append({
             'id': node_id,
             'xy': xy,
             'kind': node_kind,  # Classified based on actual degree
             'degree': actual_degree,
-            'cluster_nodes': cluster_nodes  # Store for reference
+            'cluster_nodes': cluster_nodes,  # Store for reference
+            'distance': node_distance  # Local half-width at node location
         })
     
     # Add endpoint clusters
@@ -1430,12 +1452,16 @@ def extract_graph_from_polygon(
         for s_node in cluster_nodes:
             skeleton_node_to_true_node[s_node] = true_node_idx
         
+        # Get distance value at node location (use snapped_xy for endpoint)
+        node_distance = get_node_distance(snapped_xy[0], snapped_xy[1])
+        
         nodes.append({
             'id': node_id,
             'xy': list(snapped_xy),
             'kind': node_kind,  # Classified based on actual degree
             'degree': actual_degree,  # Use actual degree from contracted graph
-            'cluster_nodes': cluster_nodes
+            'cluster_nodes': cluster_nodes,
+            'distance': node_distance  # Local half-width at node location
         })
         
         # Log if endpoint was moved
@@ -1527,12 +1553,16 @@ def extract_graph_from_polygon(
             true_nodes[true_node_idx] = tuple(xy)
             skeleton_node_to_true_node[skeleton_node_id] = true_node_idx
             
+            # Get distance value at node location
+            node_distance = get_node_distance(xy[0], xy[1])
+            
             nodes.append({
                 'id': node_id,
                 'xy': xy,
                 'kind': node_kind,
                 'degree': degree,
-                'cluster_nodes': [skeleton_node_id]  # Single node cluster
+                'cluster_nodes': [skeleton_node_id],  # Single node cluster
+                'distance': node_distance  # Local half-width at node location
             })
             
             logger.debug(f"Created missing true node {node_id} for terminal {skeleton_node_id} (degree={degree}, kind={node_kind})")
@@ -1657,12 +1687,16 @@ def extract_graph_from_polygon(
                     corner_node_id = f"N{corner_node_counter}"
                     corner_node_counter += 1
                     
+                    # Get distance value at corner node location
+                    corner_distance = get_node_distance(corner_xy[0], corner_xy[1])
+                    
                     corner_node = {
                         'id': corner_node_id,
                         'xy': list(corner_xy),
                         'kind': 'corner',
                         'degree': 2,  # Topologically degree-2
-                        'cluster_nodes': []  # Corner nodes don't have skeleton cluster nodes
+                        'cluster_nodes': [],  # Corner nodes don't have skeleton cluster nodes
+                        'distance': corner_distance  # Local half-width at node location
                     }
                     corner_nodes.append(corner_node)
                     next_node_id = corner_node_id
@@ -2282,6 +2316,14 @@ def extract_graph_from_polygons(
         if combined_poly.geom_type == 'MultiPolygon':
             combined_poly = max(combined_poly.geoms, key=lambda g: g.area)
     
+    # Get distance field from first polygon if available (use first polygon's distance field)
+    distance_field = None
+    if polygons and len(polygons) > 0:
+        poly_data = polygons[0]
+        if 'distance_field' in poly_data:
+            distance_field = poly_data['distance_field']
+            logger.debug("Using distance field from polygon data")
+    
     # Extract graph from combined polygon
     graph_result = extract_graph_from_polygon(
         combined_poly,
@@ -2300,7 +2342,8 @@ def extract_graph_from_polygons(
         corner_spur_cutoff=corner_spur_cutoff,
         e_Ramer_Douglas_Peucker=e_Ramer_Douglas_Peucker,
         min_leg_corner_detection=min_leg_corner_detection,
-        hv_transition_px=hv_transition_px
+        hv_transition_px=hv_transition_px,
+        distance_field=distance_field
     )
     
     # Optionally detect ports

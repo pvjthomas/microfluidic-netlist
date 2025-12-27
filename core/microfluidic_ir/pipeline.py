@@ -5,6 +5,7 @@ from pathlib import Path
 import math
 from .dxf_loader import load_dxf
 from .graph_extract import extract_graph_from_polygons
+from .geometry import local_scale_field
 from shapely.geometry import Polygon
 import logging
 import time
@@ -514,6 +515,76 @@ def run_pipeline(
         logger.info(f"Calculated um_per_px={um_per_px:.2f} from minimum_channel_width={minimum_channel_width:.2f} µm "
                    f"({minimum_channel_width / um_per_px:.1f} pixels across minimum width)")
     
+    # Calculate distance field (local half-width) for each polygon before skeletonization
+    distance_field_time = None
+    if selected_polygons and enable_step_c:
+        logger.info("Calculating distance fields (local half-width) for polygons...")
+        distance_field_start = time.time()
+        polygons_processed = 0
+        polygons_skipped = 0
+        total_pixels = 0
+        
+        try:
+            for i, poly_data in enumerate(selected_polygons):
+                # Convert polygon dict to Shapely Polygon
+                coords_list = poly_data['polygon']['coordinates']
+                if not coords_list or len(coords_list[0]) < 3:
+                    logger.debug(f"Polygon {i+1}: Skipping (invalid coordinates)")
+                    polygons_skipped += 1
+                    continue
+                
+                try:
+                    exterior_coords = coords_list[0]
+                    holes = coords_list[1:] if len(coords_list) > 1 else []
+                    poly = Polygon(exterior_coords, holes=holes)
+                    
+                    if poly.is_valid and poly.area > 0:
+                        poly_start = time.time()
+                        logger.debug(f"Polygon {i+1}: Calculating distance field (area={poly.area:.2f} µm², um_per_px={um_per_px:.2f})")
+                        
+                        # Calculate distance field (local half-width)
+                        dist, width, mask, transform = local_scale_field(
+                            poly,
+                            pixel_size=um_per_px,
+                            pad=0.0
+                        )
+                        
+                        poly_time = time.time() - poly_start
+                        num_pixels = mask.size
+                        total_pixels += num_pixels
+                        
+                        # Store distance field in polygon data
+                        max_half_width = float(dist.max()) if dist.size > 0 else 0.0
+                        max_width = float(width.max()) if width.size > 0 else 0.0
+                        
+                        poly_data['distance_field'] = {
+                            'dist': dist,  # Local half-width array
+                            'width': width,  # Local width array (2 * dist)
+                            'mask': mask,  # Mask array
+                            'transform': transform,  # Transform dict
+                            'max_half_width': max_half_width,
+                            'max_width': max_width
+                        }
+                        
+                        logger.debug(f"Polygon {i+1}: Distance field calculated in {poly_time:.2f}s "
+                                   f"(shape={mask.shape}, pixels={num_pixels}, "
+                                   f"max_half_width={max_half_width:.2f} µm, max_width={max_width:.2f} µm)")
+                        polygons_processed += 1
+                    else:
+                        logger.debug(f"Polygon {i+1}: Skipping invalid polygon (valid={poly.is_valid}, area={poly.area})")
+                        polygons_skipped += 1
+                except Exception as e:
+                    logger.warning(f"Polygon {i+1}: Failed to calculate distance field: {e}", exc_info=True)
+                    polygons_skipped += 1
+                    continue
+            
+            distance_field_time = time.time() - distance_field_start
+            logger.info(f"Distance fields: {polygons_processed} polygon(s) processed, {polygons_skipped} skipped, "
+                       f"{total_pixels} total pixels in {distance_field_time:.2f}s")
+        except Exception as e:
+            distance_field_time = time.time() - distance_field_start
+            logger.error(f"Error calculating distance fields after {distance_field_time:.2f}s: {e}", exc_info=True)
+    
     # Step C & D: Extract graph (only if enabled and not headful)
     graph_result = None
     step_cd_time = None
@@ -645,6 +716,8 @@ def run_pipeline(
         logger.info(f"Step A (DXF Load): {step_a_time:.2f}s")
     if step_b_time is not None:
         logger.info(f"Step B (Channel Selection): {step_b_time:.2f}s")
+    if distance_field_time is not None:
+        logger.info(f"Distance Field Calculation: {distance_field_time:.2f}s")
     if step_cd_time is not None:
         logger.info(f"Steps C & D (Graph Extraction): {step_cd_time:.2f}s")
     logger.info(f"Total pipeline time: {pipeline_total_time:.2f}s")
